@@ -5,19 +5,17 @@ const axios = require('axios');
 
 const app = express();
 
-// SimplyBook config
+// SimplyBook config (use public API base URL)
 const SIMPLYBOOK_CONFIG = {
   company: process.env.SIMPLYBOOK_COMPANY_LOGIN,
   apiKey: process.env.SIMPLYBOOK_API_KEY,
-  apiUrl: 'https://user-api-v2.simplybook.me'
+  apiUrl: 'https://user-api.simplybook.me'   // no -v2, no /admin
 };
 
-// IMPORTANT: CORS must be configured BEFORE other middleware
+// CORS
 app.use(cors({
-  origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
+  origin: function (origin, callback) {
     if (!origin) return callback(null, true);
-    
     const allowedOrigins = [
       'https://maharishiayurveda.de',
       'https://www.maharishiayurveda.de',
@@ -25,12 +23,11 @@ app.use(cors({
       'http://localhost:9292',
       'http://127.0.0.1:9292'
     ];
-    
     if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('.myshopify.com')) {
       callback(null, true);
     } else {
       console.log('Blocked by CORS:', origin);
-      callback(null, true); // Allow all for now during testing
+      callback(null, true); // relax during testing
     }
   },
   credentials: true,
@@ -38,20 +35,30 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
 
-// Handle preflight requests
 app.options('*', cors());
-
 app.use(express.json());
 
-// Rest of your code remains the same...
-// Get SimplyBook token
+// Get SimplyBook token via JSON‑RPC
 async function getSimplyBookToken() {
   try {
-    const response = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/login`, {
-      company: SIMPLYBOOK_CONFIG.company,
-      login: SIMPLYBOOK_CONFIG.apiKey
-    });
-    return response.data.token;
+    const payload = {
+      jsonrpc: '2.0',
+      method: 'getToken',
+      params: [SIMPLYBOOK_CONFIG.company, SIMPLYBOOK_CONFIG.apiKey],
+      id: 1
+    };
+
+    const response = await axios.post(
+      `${SIMPLYBOOK_CONFIG.apiUrl}/login`,
+      payload,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    if (!response.data || !response.data.result) {
+      throw new Error('No token in response');
+    }
+
+    return response.data.result;
   } catch (error) {
     console.error('SimplyBook auth error:', error.response?.data || error.message);
     throw new Error('Authentication failed');
@@ -80,7 +87,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Get Available Time Slots
+// Get Available Time Slots using getStartTimeMatrix
 app.post('/api/get-slots', async (req, res) => {
   try {
     const { serviceId, date } = req.body;
@@ -93,27 +100,36 @@ app.post('/api/get-slots', async (req, res) => {
     }
 
     const token = await getSimplyBookToken();
-    const formattedDate = new Date(date).toISOString().split('T')[0];
 
-    const response = await axios.get(
-      `${SIMPLYBOOK_CONFIG.apiUrl}/admin/book/slots`,
+    const dateObj = new Date(date);
+    const formattedDate = dateObj.toISOString().split('T')[0]; // YYYY-MM-DD
+
+    const rpcPayload = {
+      jsonrpc: '2.0',
+      method: 'getStartTimeMatrix',
+      params: [formattedDate, formattedDate, parseInt(serviceId, 10), null, 1],
+      id: 1
+    };
+
+    const response = await axios.post(
+      SIMPLYBOOK_CONFIG.apiUrl,
+      rpcPayload,
       {
         headers: {
+          'Content-Type': 'application/json',
           'X-Company-Login': SIMPLYBOOK_CONFIG.company,
           'X-Token': token
-        },
-        params: {
-          service_id: serviceId,
-          date_from: formattedDate,
-          date_to: formattedDate
         }
       }
     );
 
-    const slots = (response.data || []).map(slot => ({
-      time: slot.time,
-      available: slot.is_available !== false,
-      id: slot.datetime || slot.time
+    const matrix = response.data?.result || {};
+    const times = matrix[formattedDate] || [];
+
+    const slots = times.map(t => ({
+      time: t,
+      available: true,
+      id: `${formattedDate} ${t}`
     }));
 
     return res.json({ success: true, slots });
@@ -126,7 +142,7 @@ app.post('/api/get-slots', async (req, res) => {
   }
 });
 
-// Create Booking
+// Create Booking (still using admin API; adjust later if needed)
 app.post('/api/create-booking', async (req, res) => {
   try {
     const { serviceId, datetime, clientData } = req.body;
@@ -140,12 +156,14 @@ app.post('/api/create-booking', async (req, res) => {
 
     const token = await getSimplyBookToken();
 
+    const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
+
     // Step 1: Find or create client
     let clientId;
 
     try {
       const existingClientResp = await axios.get(
-        `${SIMPLYBOOK_CONFIG.apiUrl}/admin/clients`,
+        `${adminBase}/clients`,
         {
           headers: {
             'X-Company-Login': SIMPLYBOOK_CONFIG.company,
@@ -162,10 +180,9 @@ app.post('/api/create-booking', async (req, res) => {
       console.warn('Client lookup failed, will create new:', e.response?.data || e.message);
     }
 
-    // Create client if not found
     if (!clientId) {
       const clientResp = await axios.post(
-        `${SIMPLYBOOK_CONFIG.apiUrl}/admin/clients`,
+        `${adminBase}/clients`,
         {
           name: clientData.full_name,
           email: clientData.email,
@@ -184,7 +201,7 @@ app.post('/api/create-booking', async (req, res) => {
 
     // Step 2: Create booking
     const bookingResp = await axios.post(
-      `${SIMPLYBOOK_CONFIG.apiUrl}/admin/bookings`,
+      `${adminBase}/bookings`,
       {
         service_id: parseInt(serviceId, 10),
         client_id: parseInt(clientId, 10),
@@ -225,7 +242,7 @@ app.post('/api/create-booking', async (req, res) => {
 // Export for Vercel
 module.exports = app;
 
-// Local development only
+// Local dev
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
