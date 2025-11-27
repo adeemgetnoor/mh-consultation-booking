@@ -156,6 +156,19 @@ app.post('/api/create-booking', async (req, res) => {
   }
 });
 
+// Root route
+app.get('/', (req, res) => {
+  res.json({
+    message: 'MH Consultation Booking API',
+    status: 'running',
+    endpoints: {
+      health: '/api/health',
+      getSlots: '/api/get-slots',
+      createBooking: '/api/create-booking'
+    }
+  });
+});
+
 // Health Check
 app.get('/api/health', (req, res) => {
   res.json({
