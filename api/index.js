@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { createMollieClient } = require('@mollie/api-client');
 
 const app = express();
 
@@ -9,8 +10,13 @@ const app = express();
 const SIMPLYBOOK_CONFIG = {
   company: process.env.SIMPLYBOOK_COMPANY_LOGIN,
   apiKey: process.env.SIMPLYBOOK_API_KEY,
-  apiUrl: 'https://user-api.simplybook.me'   // no -v2, no /admin
+  apiUrl: 'https://user-api.simplybook.me' // no -v2, no /admin
 };
+
+// Mollie client (TEST or LIVE key from env)
+const mollieClient = createMollieClient({
+  apiKey: process.env.MOLLIE_API_KEY // e.g. test_xxx while developing
+});
 
 // CORS
 app.use(cors({
@@ -73,7 +79,8 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/api/health',
       getSlots: '/api/get-slots',
-      createBooking: '/api/create-booking'
+      createBooking: '/api/create-booking',
+      createPayment: '/api/create-payment'
     }
   });
 });
@@ -142,7 +149,7 @@ app.post('/api/get-slots', async (req, res) => {
   }
 });
 
-// Create Booking (still using admin API; adjust later if needed)
+// Create Booking (SimplyBook admin API)
 app.post('/api/create-booking', async (req, res) => {
   try {
     const { serviceId, datetime, clientData } = req.body;
@@ -155,7 +162,6 @@ app.post('/api/create-booking', async (req, res) => {
     }
 
     const token = await getSimplyBookToken();
-
     const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
 
     // Step 1: Find or create client
@@ -235,6 +241,43 @@ app.post('/api/create-booking', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: error.response?.data?.message || 'Failed to create booking'
+    });
+  }
+});
+
+// NEW: Create Mollie payment (TEST key)
+app.post('/api/create-payment', async (req, res) => {
+  try {
+    const { amount, description, redirectUrl, metadata } = req.body;
+
+    if (!amount || !description || !redirectUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'amount, description and redirectUrl are required'
+      });
+    }
+
+    const payment = await mollieClient.payments.create({
+      amount: {
+        value: Number(amount).toFixed(2), // "50.00"
+        currency: 'EUR'
+      },
+      description,
+      redirectUrl,
+      // Optional: webhookUrl: 'https://your-domain.com/api/mollie-webhook',
+      metadata: metadata || {}
+    });
+
+    return res.json({
+      success: true,
+      checkoutUrl: payment._links.checkout.href,
+      paymentId: payment.id
+    });
+  } catch (err) {
+    console.error('Mollie create-payment error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to create Mollie payment'
     });
   }
 });
