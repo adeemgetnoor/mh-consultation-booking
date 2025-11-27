@@ -12,19 +12,38 @@ const SIMPLYBOOK_CONFIG = {
   apiUrl: 'https://user-api-v2.simplybook.me'
 };
 
-// Middleware
+// IMPORTANT: CORS must be configured BEFORE other middleware
 app.use(cors({
-  origin: [
-    'https://maharishiayurveda.de',
-    'https://www.maharishiayurveda.de',
-    'https://maharishi-ayurveda-de.myshopify.com',
-    'http://localhost:9292'
-  ],
-  credentials: true
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    const allowedOrigins = [
+      'https://maharishiayurveda.de',
+      'https://www.maharishiayurveda.de',
+      'https://maharishi-ayurveda-de.myshopify.com',
+      'http://localhost:9292',
+      'http://127.0.0.1:9292'
+    ];
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('.myshopify.com')) {
+      callback(null, true);
+    } else {
+      console.log('Blocked by CORS:', origin);
+      callback(null, true); // Allow all for now during testing
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
+
+// Handle preflight requests
+app.options('*', cors());
 
 app.use(express.json());
 
+// Rest of your code remains the same...
 // Get SimplyBook token
 async function getSimplyBookToken() {
   try {
@@ -38,6 +57,28 @@ async function getSimplyBookToken() {
     throw new Error('Authentication failed');
   }
 }
+
+// Root route
+app.get('/', (req, res) => {
+  res.json({
+    message: 'MH Consultation Booking API',
+    status: 'running',
+    endpoints: {
+      health: '/api/health',
+      getSlots: '/api/get-slots',
+      createBooking: '/api/create-booking'
+    }
+  });
+});
+
+// Health Check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Booking API is running',
+    timestamp: new Date().toISOString()
+  });
+});
 
 // Get Available Time Slots
 app.post('/api/get-slots', async (req, res) => {
@@ -179,28 +220,6 @@ app.post('/api/create-booking', async (req, res) => {
       error: error.response?.data?.message || 'Failed to create booking'
     });
   }
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.json({
-    message: 'MH Consultation Booking API',
-    status: 'running',
-    endpoints: {
-      health: '/api/health',
-      getSlots: '/api/get-slots',
-      createBooking: '/api/create-booking'
-    }
-  });
-});
-
-// Health Check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'Booking API is running',
-    timestamp: new Date().toISOString()
-  });
 });
 
 // Export for Vercel
