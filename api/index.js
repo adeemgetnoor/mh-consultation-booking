@@ -8,32 +8,30 @@ const { createMollieClient } = require('@mollie/api-client');
 const app = express();
 
 /**
- * Env:
- * SIMPLYBOOK_COMPANY_LOGIN
- * SIMPLYBOOK_API_KEY
- * SIMPLYBOOK_API_SECRET (optional - try if access denied with regular key)
- * MOLLIE_API_KEY
- * CACHE_ADMIN_SECRET (optional)
+ * Environment expectations:
+ * - SIMPLYBOOK_COMPANY_LOGIN  (your company login)
+ * - SIMPLYBOOK_API_KEY       (your API key shown in SimplyBook; used for getToken)
+ * - MOLLIE_API_KEY           (optional, for payments)
+ * - CACHE_ADMIN_SECRET       (optional, for forced refresh endpoint)
  */
 const SIMPLYBOOK_CONFIG = {
   company: process.env.SIMPLYBOOK_COMPANY_LOGIN,
   apiKey: process.env.SIMPLYBOOK_API_KEY,
-  apiSecret: process.env.SIMPLYBOOK_API_SECRET || null,
-  apiUrl: 'https://user-api.simplybook.me'
+  apiUrl: 'https://user-api.simplybook.me' // base url used by login and admin endpoints
 };
 
 const mollieClient = createMollieClient({
   apiKey: process.env.MOLLIE_API_KEY || ''
 });
 
-if (!SIMPLYBOOK_CONFIG.company) console.warn('SIMPLYBOOK_COMPANY_LOGIN not set');
-if (!SIMPLYBOOK_CONFIG.apiKey) console.warn('SIMPLYBOOK_API_KEY not set');
+if (!SIMPLYBOOK_CONFIG.company || !SIMPLYBOOK_CONFIG.apiKey) {
+  console.warn('Warning: SimplyBook company or apiKey not set in env.');
+}
 
 app.use(express.json());
-
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
+    if (!origin) return callback(null, true); // allow server-side requests
     const allowedOrigins = [
       'https://maharishiayurveda.de',
       'https://www.maharishiayurveda.de',
@@ -42,152 +40,98 @@ app.use(cors({
       'http://localhost:9292',
       'http://127.0.0.1:9292'
     ];
-    if (allowedOrigins.indexOf(origin) !== -1 || (origin && origin.includes('.myshopify.com'))) {
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('.myshopify.com')) {
       return callback(null, true);
     }
-    console.log('Blocked by CORS (origin not explicitly allowed):', origin);
-    return callback(null, true); // relaxed for dev; change to callback(new Error(...)) to enforce
+    console.log('CORS: allowing unknown origin for now (relaxed):', origin);
+    return callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Company-Login', 'X-Token']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
 app.options('*', cors());
 
-// simple in-memory caches
-let tokenCache = {
-  token: null,
-  fetchedAt: 0,
-  ttlMs: 1000 * 60 * 50
-};
+// Simple in-memory caches
+let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
+let servicesCache = { data: null, fetchedAt: 0, ttlMs: 1000 * 60 * 5 };
 
-let servicesCache = {
-  data: null,
-  fetchedAt: 0,
-  ttlMs: 1000 * 60 * 5
-};
-
-// small helper to call the JSON-RPC endpoints (admin or public)
-async function callRpc(url, payload, headers = {}) {
-  try {
-    const resp = await axios.post(url, payload, {
-      headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
-      timeout: 15000
-    });
-    return resp.data;
-  } catch (err) {
-    // wrap error with response body if present
-    const info = err.response?.data || err.message;
-    throw new Error(typeof info === 'string' ? info : JSON.stringify(info));
-  }
-}
-
-// getToken using a provided apiKey (normal or secret)
-async function getTokenForKey(apiKey) {
-  const payload = {
-    jsonrpc: '2.0',
-    method: 'getToken',
-    params: [SIMPLYBOOK_CONFIG.company, apiKey],
-    id: 1
-  };
-
-  const resp = await callRpc(`${SIMPLYBOOK_CONFIG.apiUrl}/login`, payload);
-  // resp expected { result: 'TOKEN', id: '1', jsonrpc: '2.0' } on success
-  if (!resp || !resp.result) {
-    throw new Error('No token in getToken response: ' + JSON.stringify(resp));
-  }
-  return resp.result;
-}
-
-// cached token getter - tries normal key then secret if provided & forced
-async function getSimplyBookTokenCached({ useSecret = false } = {}) {
+/** getSimplyBookTokenCached
+ * Uses JSON-RPC getToken on https://user-api.simplybook.me/login
+ */
+async function getSimplyBookTokenCached() {
   const now = Date.now();
-  if (tokenCache.token && (now - tokenCache.fetchedAt) < tokenCache.ttlMs && !useSecret) {
+  if (tokenCache.token && (now - tokenCache.fetchedAt) < tokenCache.ttlMs) {
     return tokenCache.token;
   }
 
-  // try main key first or explicitly secret
-  const keyToUse = useSecret && SIMPLYBOOK_CONFIG.apiSecret ? SIMPLYBOOK_CONFIG.apiSecret : SIMPLYBOOK_CONFIG.apiKey;
-  if (!keyToUse) throw new Error('No API key available for getToken');
-
-  try {
-    const token = await getTokenForKey(keyToUse);
-    tokenCache.token = token;
-    tokenCache.fetchedAt = Date.now();
-    return token;
-  } catch (err) {
-    throw new Error('getToken failed: ' + err.message);
-  }
-}
-
-// Normalize an event (SimplyBook shape) -> service object used by frontend
-function normalizeEventToService(e) {
-  const startDate = e.start_date || e.start || e.date || null;
-  const price = e.price || e.cost || (e.prices && e.prices[0] && e.prices[0].value) || '';
-  const category = e.group_name || e.category_name || (e.category && e.category.name) || 'General';
-
-  return {
-    id: e.id || e.event_id || e.id_event || null,
-    name: e.name || e.title || e.service_name || e.summary || '',
-    description: e.description || e.long_description || e.details || '',
-    price: price ? String(price) : '',
-    duration: e.duration || e.length || e.duration_minutes || '',
-    category_name: category,
-    category_id: (e.category && e.category.id) ? e.category.id : (e.category_id || null),
-    image_url: e.image_url || e.picture_url || e.photo_url || null,
-    status: e.status || (e.active ? 'online' : 'offline') || 'online',
-    raw: e
-  };
-}
-
-// Try admin getEventList (with wide date range) -> returns array of events or throws
-async function adminGetEventList(token, startDate, endDate) {
   const payload = {
     jsonrpc: '2.0',
-    method: 'getEventList',
-    params: [startDate, endDate],
+    method: 'getToken',
+    params: [SIMPLYBOOK_CONFIG.company, SIMPLYBOOK_CONFIG.apiKey],
     id: 1
   };
 
-  const headers = {
-    'X-Company-Login': SIMPLYBOOK_CONFIG.company,
-    'X-Token': token
-  };
-
-  const resp = await callRpc(`${SIMPLYBOOK_CONFIG.apiUrl}/admin`, payload, headers);
-  return resp;
-}
-
-// Try public getEventListPublic or public getEventList
-async function publicGetEventList() {
-  // first try public getEventListPublic
   try {
-    const payloadPublic = {
-      jsonrpc: '2.0',
-      method: 'getEventListPublic',
-      params: [],
-      id: 1
-    };
-    const resp = await callRpc(`${SIMPLYBOOK_CONFIG.apiUrl}`, payloadPublic);
-    return resp;
+    const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/login`, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000
+    });
+    if (!resp.data || !resp.data.result) throw new Error('No token in login response');
+    tokenCache.token = resp.data.result;
+    tokenCache.fetchedAt = Date.now();
+    console.log('Obtained new SimplyBook token (cached).');
+    return tokenCache.token;
   } catch (err) {
-    // fallback to public getEventList
-    const payload = {
-      jsonrpc: '2.0',
-      method: 'getEventList',
-      params: [],
-      id: 1
-    };
-    const resp2 = await callRpc(`${SIMPLYBOOK_CONFIG.apiUrl}`, payload);
-    return resp2;
+    console.error('getSimplyBookTokenCached error:', err.response?.data || err.message);
+    throw new Error('Failed to obtain SimplyBook token');
   }
 }
 
 /**
- * fetchServicesCached:
- * - attempts admin getEventList with token (today -> +365)
- * - if Access denied, optionally tries secret key, then falls back to public RPCs
- * - normalizes events into services array
+ * Helper: callAdminRpc
+ * Calls the admin RPC endpoint (POST to /admin) with X-Company-Login and X-Token
+ */
+async function callAdminRpc(token, method, params = [], timeout = 15000) {
+  const payload = {
+    jsonrpc: '2.0',
+    method,
+    params,
+    id: 1
+  };
+
+  const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/admin`, payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Company-Login': SIMPLYBOOK_CONFIG.company,
+      'X-Token': token
+    },
+    timeout
+  });
+
+  return resp.data;
+}
+
+/**
+ * Helper: callPublicRpc
+ * Calls the public RPC endpoint (POST to base apiUrl) — no headers required for public calls
+ */
+async function callPublicRpc(method, params = [], timeout = 15000) {
+  const payload = { jsonrpc: '2.0', method, params, id: 1 };
+  const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}`, payload, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout
+  });
+  return resp.data;
+}
+
+/**
+ * fetchServicesCached
+ * Primary strategy:
+ *  1) Try admin RPC getEventList (requires token). If returns events, normalize & cache.
+ *  2) If admin call fails with access denied OR returns no events:
+ *     - try public getEventListPublic
+ *     - if still nothing, try getServiceListPublic
  */
 async function fetchServicesCached(forceRefresh = false) {
   const now = Date.now();
@@ -195,92 +139,136 @@ async function fetchServicesCached(forceRefresh = false) {
     return servicesCache.data;
   }
 
-  // date range: today -> +365 days
-  const today = new Date();
-  const start = today.toISOString().split('T')[0];
-  const endDate = new Date();
-  endDate.setDate(endDate.getDate() + 365);
-  const end = endDate.toISOString().split('T')[0];
-
-  // attempt admin with main key token
+  // Try admin getEventList first
   try {
-    const token = await getSimplyBookTokenCached({ useSecret: false });
-    console.log('Trying admin getEventList with token (main key). Range:', start, end);
-    const adminResp = await adminGetEventList(token, start, end);
-    console.log('admin getEventList raw (main):', typeof adminResp === 'object' ? JSON.stringify(adminResp).slice(0, 3000) : String(adminResp));
+    const token = await getSimplyBookTokenCached();
+    // request for a reasonable date window (today -> +1 year)
+    const from = new Date().toISOString().split('T')[0];
+    const to = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0];
 
-    // check for error
-    if (adminResp && adminResp.error) {
-      const errMsg = adminResp.error.message || JSON.stringify(adminResp.error);
-      // if "Access denied", we'll attempt secret key (if available) then public fallback
-      if (errMsg.toLowerCase().includes('access denied') || errMsg.toLowerCase().includes('access')) {
-        console.warn('admin getEventList returned error (main key):', errMsg);
-        // try secret (if provided)
-        if (SIMPLYBOOK_CONFIG.apiSecret) {
-          try {
-            const secretToken = await getSimplyBookTokenCached({ useSecret: true });
-            console.log('Trying admin getEventList with secret API key token. Range:', start, end);
-            const adminResp2 = await adminGetEventList(secretToken, start, end);
-            console.log('admin getEventList raw (secret):', typeof adminResp2 === 'object' ? JSON.stringify(adminResp2).slice(0, 3000) : String(adminResp2));
-            if (adminResp2 && adminResp2.result && Array.isArray(adminResp2.result) && adminResp2.result.length > 0) {
-              const services = adminResp2.result.map(normalizeEventToService);
-              servicesCache.data = services;
-              servicesCache.fetchedAt = Date.now();
-              return services;
-            } else {
-              console.warn('admin getEventList with secret returned no events or empty result.');
-            }
-          } catch (err) {
-            console.warn('admin getEventList with secret failed:', err.message || err);
-          }
-        }
-
-        // fallback to public RPCs below
-      } else {
-        // other error - propagate as fallback to public
-        console.warn('admin getEventList returned non-access error (main):', errMsg);
-      }
-    } else {
-      // success path: adminResp.result may contain events array
-      const events = Array.isArray(adminResp) ? adminResp : (adminResp.result || adminResp.events || []);
-      if (Array.isArray(events) && events.length > 0) {
-        const services = events.map(normalizeEventToService);
-        services.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '') || (a.name || '').localeCompare(b.name || ''));
-        servicesCache.data = services;
-        servicesCache.fetchedAt = Date.now();
-        return services;
-      } else {
-        console.warn('admin getEventList returned zero events (main key) — trying other fallbacks.');
-      }
-    }
-  } catch (err) {
-    console.warn('admin getEventList attempt failed (main):', err.message || err);
-    // continue to try secret/public below
-  }
-
-  // If we reach here, try public endpoints
-  try {
-    console.log('Attempting public getEventListPublic / public getEventList fallback...');
-    const publicResp = await publicGetEventList();
-    console.log('public getEventList raw:', typeof publicResp === 'object' ? JSON.stringify(publicResp).slice(0, 3000) : String(publicResp));
-
-    const events = Array.isArray(publicResp) ? publicResp : (publicResp.result || publicResp.events || []);
-    if (Array.isArray(events) && events.length > 0) {
-      const services = events.map(normalizeEventToService);
-      services.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '') || (a.name || '').localeCompare(b.name || ''));
+    console.log('Attempting admin getEventList', { from, to });
+    const adminResp = await callAdminRpc(token, 'getEventList', [from, to]);
+    if (adminResp && adminResp.result && Array.isArray(adminResp.result) && adminResp.result.length > 0) {
+      console.log('admin getEventList returned', adminResp.result.length, 'events');
+      const services = normalizeEventsToServices(adminResp.result);
       servicesCache.data = services;
       servicesCache.fetchedAt = Date.now();
       return services;
-    } else {
-      throw new Error('no events returned by getEventList/getEventListPublic');
     }
+
+    // If adminResp has error (access denied), throw to fall back
+    if (adminResp && adminResp.error) {
+      const code = adminResp.error.code;
+      console.warn('admin getEventList returned error', adminResp.error);
+      if (code === -32600 || String(adminResp.error.message).toLowerCase().includes('access')) {
+        throw new Error('admin_access_denied');
+      }
+    }
+
+    console.log('admin getEventList returned no events -> will try public methods');
   } catch (err) {
-    console.error('fetchServicesCached error:', err.message || err);
-    throw new Error('Failed to fetch services from SimplyBook (no events returned by getEventList/getEventListPublic).');
+    console.warn('admin getEventList failed:', err.message || err);
+    // continue to public fallbacks
   }
+
+  // Fallback: getEventListPublic (public RPC)
+  try {
+    console.log('Trying public getEventListPublic');
+    const publicResp = await callPublicRpc('getEventListPublic', []);
+    if (publicResp && publicResp.result && Array.isArray(publicResp.result) && publicResp.result.length > 0) {
+      console.log('getEventListPublic returned', publicResp.result.length, 'events');
+      const services = normalizeEventsToServices(publicResp.result);
+      servicesCache.data = services;
+      servicesCache.fetchedAt = Date.now();
+      return services;
+    }
+    console.log('getEventListPublic returned no events or empty array');
+  } catch (err) {
+    console.warn('getEventListPublic failed:', err.response?.data || err.message);
+  }
+
+  // Last fallback: getServiceListPublic (some accounts expose services via this)
+  try {
+    console.log('Trying public getServiceListPublic');
+    const svcResp = await callPublicRpc('getServiceListPublic', []);
+    if (svcResp && svcResp.result && Array.isArray(svcResp.result) && svcResp.result.length > 0) {
+      console.log('getServiceListPublic returned', svcResp.result.length, 'items');
+      const services = normalizeServicesListPublic(svcResp.result);
+      servicesCache.data = services;
+      servicesCache.fetchedAt = Date.now();
+      return services;
+    }
+    console.log('getServiceListPublic returned no items');
+  } catch (err) {
+    console.warn('getServiceListPublic failed:', err.response?.data || err.message);
+  }
+
+  // Nothing found
+  throw new Error('Failed to fetch services from SimplyBook (no events returned by getEventList/getEventListPublic/getServiceListPublic).');
 }
 
-// small helper wrappers for routes below
+/**
+ * Normalizers
+ * convert different RPC shapes into a uniform service object:
+ * { id, name, description, price, duration, category_name, image_url, status, raw }
+ */
+function normalizeEventsToServices(events = []) {
+  return events.map(e => {
+    // event shape varies across accounts; pick best-guess fields
+    const name = e.name || e.title || e.service_name || e.event_name || '';
+    const id = e.id || e.event_id || e.service_id || null;
+    const duration = e.duration || e.length || e.duration_minutes || e.event_duration || '';
+    const price = (e.price || e.cost || (e.pricing && e.pricing.price) || '') + '';
+    const cat = e.unit_group_name || e.category || e.category_name || e.group_name || (e.location || '') || 'General';
+    let image_url = null;
+    if (e.image) image_url = (typeof e.image === 'string') ? e.image : (e.image.url || null);
+    image_url = image_url || e.image_url || e.picture_url || null;
+
+    const description = e.description || e.long_description || e.details || e.text || '';
+    const status = e.status || (e.active ? 'online' : 'offline') || 'online';
+
+    return {
+      id,
+      name,
+      description,
+      price,
+      duration,
+      category_name: cat,
+      category_id: e.category_id || e.unit_group_id || null,
+      image_url,
+      status,
+      raw: e
+    };
+  });
+}
+
+function normalizeServicesListPublic(items = []) {
+  return items.map(s => {
+    const id = s.id || s.service_id || null;
+    const name = s.name || s.title || '';
+    const price = (s.price || s.cost || '') + '';
+    const duration = s.duration || s.length || '';
+    const cat = s.category_name || s.group_name || 'General';
+    let image_url = s.image || s.image_url || s.picture_url || null;
+    if (image_url && typeof image_url === 'object') image_url = image_url.url || null;
+    return {
+      id,
+      name,
+      description: s.description || '',
+      price,
+      duration,
+      category_name: cat,
+      category_id: s.category_id || null,
+      image_url,
+      status: s.status || 'online',
+      raw: s
+    };
+  });
+}
+
+// -------------------------
+// Routes
+// -------------------------
 app.get('/', (req, res) => {
   res.json({
     message: 'MH Consultation Booking API',
@@ -296,13 +284,13 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'Booking API is running',
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'ok', message: 'Booking API running', timestamp: new Date().toISOString() });
 });
 
+/**
+ * GET /api/services
+ * Query: ?force=true to bypass cache (protected in prod by x-cache-admin-secret)
+ */
 app.get('/api/services', async (req, res) => {
   try {
     const force = req.query.force === 'true';
@@ -312,6 +300,7 @@ app.get('/api/services', async (req, res) => {
         return res.status(401).json({ ok: false, error: 'Unauthorized to force refresh cache' });
       }
     }
+
     const services = await fetchServicesCached(force);
     return res.json({ ok: true, fetched_at: new Date().toISOString(), count: services.length, data: services });
   } catch (err) {
@@ -320,24 +309,17 @@ app.get('/api/services', async (req, res) => {
   }
 });
 
-// Purge cache
-app.post('/api/purge-cache', (req, res) => {
-  const secret = req.headers['x-cache-admin-secret'] || req.body?.admin_secret;
-  if (!process.env.CACHE_ADMIN_SECRET || secret !== process.env.CACHE_ADMIN_SECRET) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
-  }
-  tokenCache = { token: null, fetchedAt: 0, ttlMs: tokenCache.ttlMs };
-  servicesCache = { data: null, fetchedAt: 0, ttlMs: servicesCache.ttlMs };
-  return res.json({ ok: true, message: 'Caches purged' });
-});
+/**
+ * POST /api/get-slots, /api/create-booking, /api/create-payment
+ * Keep your existing (unchanged) implementations — simplified for brevity here
+ */
 
-// get start time matrix (unchanged)
+// Get Available Time Slots (same logic as earlier - uses getStartTimeMatrix RPC on admin)
 app.post('/api/get-slots', async (req, res) => {
   try {
     const { serviceId, date } = req.body;
-    if (!serviceId || !date) {
-      return res.status(400).json({ success: false, error: 'Service ID and date are required' });
-    }
+    if (!serviceId || !date) return res.status(400).json({ success: false, error: 'Service ID and date are required' });
+
     const token = await getSimplyBookTokenCached();
     const dateObj = new Date(date);
     if (isNaN(dateObj)) return res.status(400).json({ success: false, error: 'Invalid date' });
@@ -369,17 +351,16 @@ app.post('/api/get-slots', async (req, res) => {
   }
 });
 
-// create booking (unchanged)
+// Create Booking (admin bookings)
 app.post('/api/create-booking', async (req, res) => {
   try {
     const { serviceId, datetime, clientData } = req.body;
-    if (!serviceId || !datetime || !clientData) {
-      return res.status(400).json({ success: false, error: 'Missing required booking data' });
-    }
+    if (!serviceId || !datetime || !clientData) return res.status(400).json({ success: false, error: 'Missing required booking data' });
+
     const token = await getSimplyBookTokenCached();
     const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
 
-    // find/create client
+    // try to find existing client
     let clientId;
     try {
       const existingClientResp = await axios.get(`${adminBase}/clients`, {
@@ -432,13 +413,11 @@ app.post('/api/create-booking', async (req, res) => {
   }
 });
 
-// create mollie payment (unchanged)
+// Mollie payment (unchanged)
 app.post('/api/create-payment', async (req, res) => {
   try {
     const { amount, description, redirectUrl, metadata } = req.body;
-    if (!amount || !description || !redirectUrl) {
-      return res.status(400).json({ success: false, error: 'amount, description and redirectUrl are required' });
-    }
+    if (!amount || !description || !redirectUrl) return res.status(400).json({ success: false, error: 'amount, description and redirectUrl are required' });
     if (!process.env.MOLLIE_API_KEY) return res.status(500).json({ success: false, error: 'Mollie API key not configured' });
 
     const payment = await mollieClient.payments.create({
@@ -453,6 +432,17 @@ app.post('/api/create-payment', async (req, res) => {
     console.error('Mollie create-payment error:', err);
     return res.status(500).json({ success: false, error: 'Failed to create Mollie payment' });
   }
+});
+
+// Admin-only: purge caches
+app.post('/api/purge-cache', (req, res) => {
+  const secret = req.headers['x-cache-admin-secret'] || req.body?.admin_secret;
+  if (!process.env.CACHE_ADMIN_SECRET || secret !== process.env.CACHE_ADMIN_SECRET) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  tokenCache = { token: null, fetchedAt: 0, ttlMs: tokenCache.ttlMs };
+  servicesCache = { data: null, fetchedAt: 0, ttlMs: servicesCache.ttlMs };
+  return res.json({ ok: true, message: 'Caches purged' });
 });
 
 module.exports = app;
