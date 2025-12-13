@@ -333,6 +333,17 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Booking API running', timestamp: new Date().toISOString() });
 });
 
+// Test endpoint for booking API connectivity
+app.post('/api/test-booking', async (req, res) => {
+  try {
+    console.log('Test booking endpoint hit with body:', req.body);
+    return res.json({ success: true, message: 'API connectivity test successful', received: req.body });
+  } catch (error) {
+    console.error('Test booking error:', error.message);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Main endpoint the frontend will call: returns normalized services from SimplyBook
 app.get('/api/services', async (req, res) => {
   try {
@@ -449,7 +460,37 @@ app.post('/api/create-booking', async (req, res) => {
     };
 
     console.log('Creating booking with payload:', bookingPayload);
-    const bookingResp = await callAdminRpc(token, 'bookSession', [bookingPayload]);
+    
+    let bookingResp;
+    try {
+      // Try different booking methods that SimplyBook might use
+      bookingResp = await callAdminRpc(token, 'bookSession', [bookingPayload]);
+    } catch (e1) {
+      console.warn('bookSession failed, trying createBooking:', e1.message);
+      try {
+        bookingResp = await callAdminRpc(token, 'createBooking', [bookingPayload]);
+      } catch (e2) {
+        console.warn('createBooking failed, trying addBooking:', e2.message);
+        try {
+          bookingResp = await callAdminRpc(token, 'addBooking', [bookingPayload]);
+        } catch (e3) {
+          console.warn('addBooking failed, trying bookEvent:', e3.message);
+          try {
+            // Simplified payload for bookEvent
+            const simplePayload = {
+              service_id: bookingPayload.service_id,
+              client_id: bookingPayload.client_id,
+              start_datetime: bookingPayload.start_datetime,
+              end_datetime: bookingPayload.end_datetime
+            };
+            bookingResp = await callAdminRpc(token, 'bookEvent', [simplePayload]);
+          } catch (e4) {
+            console.error('All booking methods failed:', e4.message);
+            throw e4;
+          }
+        }
+      }
+    }
 
     return res.json({ success: true, booking: bookingResp.data, message: 'Booking created successfully' });
   } catch (error) {
