@@ -452,10 +452,14 @@ app.post('/api/create-booking', async (req, res) => {
     };
 
     let bookingResp;
+    let methodUsed = 'none';
+    
     try {
+      methodUsed = 'bookSession';
       bookingResp = await callAdminRpc(token, 'bookSession', [bookingPayload]);
     } catch (e1) {
       try {
+        methodUsed = 'createBooking';
         const simplePayload = {
           service_id: bookingPayload.service_id,
           client_id: bookingPayload.client_id,
@@ -465,6 +469,7 @@ app.post('/api/create-booking', async (req, res) => {
         bookingResp = await callAdminRpc(token, 'createBooking', [simplePayload]);
       } catch (e2) {
         try {
+          methodUsed = 'addBooking';
           const simplePayload = {
             service_id: bookingPayload.service_id,
             client_id: bookingPayload.client_id,
@@ -474,6 +479,7 @@ app.post('/api/create-booking', async (req, res) => {
           bookingResp = await callAdminRpc(token, 'addBooking', [simplePayload]);
         } catch (e3) {
           try {
+            methodUsed = 'bookEvent';
             const simplePayload = {
               service_id: bookingPayload.service_id,
               client_id: bookingPayload.client_id,
@@ -483,12 +489,14 @@ app.post('/api/create-booking', async (req, res) => {
             bookingResp = await callAdminRpc(token, 'bookEvent', [simplePayload]);
           } catch (e4) {
             try {
+              methodUsed = 'book';
               const minimalPayload = {
                 service_id: bookingPayload.service_id,
                 start_datetime: bookingPayload.start_datetime
               };
               bookingResp = await callAdminRpc(token, 'book', [minimalPayload]);
             } catch (e5) {
+              console.error('All booking methods failed. Last error:', e5.message);
               throw e5;
             }
           }
@@ -496,7 +504,17 @@ app.post('/api/create-booking', async (req, res) => {
       }
     }
 
-    return res.json({ success: true, booking: bookingResp.data, message: 'Booking created successfully' });
+    return res.json({ 
+      success: true, 
+      booking: bookingResp.data, 
+      message: 'Booking created successfully',
+      booking_id: bookingResp.id || bookingResp.booking_id || bookingResp.result?.id || null,
+      response_keys: Object.keys(bookingResp),
+      full_response: bookingResp,
+      method_used: methodUsed,
+      service_id: bookingPayload.service_id,
+      client_id: bookingPayload.client_id
+    });
   } catch (error) {
     console.error('create-booking error:', error.response?.data || error.message);
     return res.status(500).json({ success: false, error: error.response?.data?.message || 'Failed to create booking' });
