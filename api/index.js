@@ -28,6 +28,31 @@ if (!SIMPLYBOOK_CONFIG.company || !SIMPLYBOOK_CONFIG.apiKey) {
   console.warn('Warning: SimplyBook company or apiKey not set in env.');
 }
 
+function normalizeServicesAdmin(items = []) {
+  return items.map(s => {
+    const id = s.id || s.service_id || null;
+    const name = s.name || s.title || '';
+    const price = (s.price || s.default_price || s.cost || '') + '';
+    const duration = s.duration || s.length || '';
+    const cat = (s.category && (s.category.name || s.category.title)) || s.category_name || s.group_name || 'General';
+    let image_url = s.image || s.image_url || s.picture_url || null;
+    if (image_url && typeof image_url === 'object') image_url = image_url.url || null;
+    const status = (typeof s.active === 'boolean') ? (s.active ? 'online' : 'offline') : (s.status || 'online');
+    return {
+      id,
+      name,
+      description: s.description || '',
+      price,
+      duration,
+      category_name: cat,
+      category_id: s.category_id || (s.category && s.category.id) || null,
+      image_url,
+      status,
+      raw: s
+    };
+  });
+}
+
 app.use(express.json());
 app.use(cors({
   origin: function (origin, callback) {
@@ -177,7 +202,10 @@ async function fetchServicesCached(forceRefresh = false) {
   // Fallback: getEventListPublic (public RPC)
   try {
     console.log('Trying public getEventListPublic');
-    const publicResp = await callPublicRpc('getEventListPublic', []);
+    // Provide a date window like the admin call (today -> +1 year)
+    const from = new Date().toISOString().split('T')[0];
+    const to = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0];
+    const publicResp = await callPublicRpc('getEventListPublic', [from, to]);
     if (publicResp && publicResp.result && Array.isArray(publicResp.result) && publicResp.result.length > 0) {
       console.log('getEventListPublic returned', publicResp.result.length, 'events');
       const services = normalizeEventsToServices(publicResp.result);
@@ -204,6 +232,31 @@ async function fetchServicesCached(forceRefresh = false) {
     console.log('getServiceListPublic returned no items');
   } catch (err) {
     console.warn('getServiceListPublic failed:', err.response?.data || err.message);
+  }
+
+  // Additional fallback: Admin REST /admin/services (requires token)
+  try {
+    console.log('Trying admin REST /admin/services');
+    const token = await getSimplyBookTokenCached();
+    const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
+    const resp = await axios.get(`${adminBase}/services`, {
+      headers: {
+        'X-Company-Login': SIMPLYBOOK_CONFIG.company,
+        'X-Token': token
+      },
+      timeout: 15000
+    });
+    const itemsRaw = Array.isArray(resp.data) ? resp.data : (resp.data.result || resp.data.services || []);
+    if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
+      console.log('/admin/services returned', itemsRaw.length, 'items');
+      const services = normalizeServicesAdmin(itemsRaw);
+      servicesCache.data = services;
+      servicesCache.fetchedAt = Date.now();
+      return services;
+    }
+    console.log('/admin/services returned no items');
+  } catch (err) {
+    console.warn('Admin REST /admin/services failed:', err.response?.data || err.message);
   }
 
   // Nothing found
