@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { createMollieClient } = require('@mollie/api-client');
+const simplyBookRouter = require('./simplybook-rpc.router');
 
 const app = express();
 
@@ -76,6 +77,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
 app.options('*', cors());
+app.use('/api/sb', simplyBookRouter);
 
 // Simple in-memory caches
 let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
