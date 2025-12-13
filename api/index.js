@@ -118,8 +118,11 @@ async function callAdminRpc(token, method, params = [], timeout = 15000) {
  */
 async function callPublicRpc(method, params = [], timeout = 15000) {
   const payload = { jsonrpc: '2.0', method, params, id: 1 };
+  const headers = { 'Content-Type': 'application/json' };
+  // Some public RPC methods require specifying company via header
+  if (SIMPLYBOOK_CONFIG.company) headers['X-Company-Login'] = SIMPLYBOOK_CONFIG.company;
   const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}`, payload, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     timeout
   });
   return resp.data;
