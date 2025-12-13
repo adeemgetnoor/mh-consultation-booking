@@ -19,7 +19,8 @@ const app = express();
 const SIMPLYBOOK_CONFIG = {
   company: process.env.SIMPLYBOOK_COMPANY_LOGIN,
   apiKey: process.env.SIMPLYBOOK_API_KEY,
-  apiUrl: 'https://user-api.simplybook.me' // base url used by login and admin endpoints
+  apiSecret: process.env.SIMPLYBOOK_API_SECRET,
+  apiUrl: 'https://user-api.simplybook.me'
 };
 
 const mollieClient = createMollieClient({
@@ -168,12 +169,27 @@ async function getSimplyBookTokenCached() {
 async function callAdminRpc(token, method, params = [], timeout = 15000) {
   const payload = { jsonrpc: '2.0', method, params, id: 1 };
 
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Company-Login': SIMPLYBOOK_CONFIG.company,
+    'X-Token': token
+  };
+
+  // Add signature if secret key is available
+  if (SIMPLYBOOK_CONFIG.apiSecret) {
+    const crypto = require('crypto');
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = crypto
+      .createHmac('sha256', SIMPLYBOOK_CONFIG.apiSecret)
+      .update(`${timestamp}${JSON.stringify(payload)}`)
+      .digest('hex');
+    
+    headers['X-Signature'] = signature;
+    headers['X-Timestamp'] = timestamp.toString();
+  }
+
   const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/admin`, payload, {
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Company-Login': SIMPLYBOOK_CONFIG.company,
-      'X-Token': token
-    },
+    headers,
     timeout
   });
 
@@ -422,16 +438,29 @@ app.post('/api/create-booking', async (req, res) => {
     }
 
     if (!clientId) {
-      const clientResp = await axios.post(`${adminBase}/clients`, {
-        name: clientData.full_name,
-        email: clientData.email,
-        phone: clientData.phone
-      }, {
-        headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token, 'Content-Type': 'application/json' },
-        timeout: 15000
-      });
-      const clientDataResp = clientResp.data && clientResp.data.id ? clientResp.data : (clientResp.data.result || clientResp.data.client || clientResp.data);
-      clientId = clientDataResp.id;
+      try {
+        const clientResp = await axios.post(`${adminBase}/clients`, {
+          name: clientData.full_name,
+          email: clientData.email,
+          phone: clientData.phone
+        }, {
+          headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token, 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+        const clientDataResp = clientResp.data && clientResp.data.id ? clientResp.data : (clientResp.data.result || clientResp.data.client || clientResp.data);
+        clientId = clientDataResp.id;
+      } catch (clientError) {
+        console.error('Client creation failed:', clientError.response?.data || clientError.message);
+        return res.status(500).json({ 
+          success: false, 
+          error: 'Failed to create client in SimplyBook',
+          details: clientError.response?.data || clientError.message
+        });
+      }
+    }
+
+    if (!clientId) {
+      return res.status(500).json({ success: false, error: 'Could not create or find client' });
     }
 
     // create booking using RPC
@@ -453,11 +482,21 @@ app.post('/api/create-booking', async (req, res) => {
 
     let bookingResp;
     let methodUsed = 'none';
+    let lastError;
     
     try {
       methodUsed = 'bookSession';
       bookingResp = await callAdminRpc(token, 'bookSession', [bookingPayload]);
     } catch (e1) {
+      lastError = e1;
+      if (e1.message.includes('Access denied')) {
+        return res.status(403).json({ 
+          success: false, 
+          error: 'SimplyBook API access denied. Your API key may not have booking permissions.',
+          details: 'Check your SimplyBook dashboard API settings and ensure booking permissions are enabled.',
+          method_attempted: methodUsed
+        });
+      }
       try {
         methodUsed = 'createBooking';
         const simplePayload = {
@@ -468,6 +507,15 @@ app.post('/api/create-booking', async (req, res) => {
         };
         bookingResp = await callAdminRpc(token, 'createBooking', [simplePayload]);
       } catch (e2) {
+        lastError = e2;
+        if (e2.message.includes('Access denied')) {
+          return res.status(403).json({ 
+            success: false, 
+            error: 'SimplyBook API access denied. Your API key may not have booking permissions.',
+            details: 'Check your SimplyBook dashboard API settings and ensure booking permissions are enabled.',
+            method_attempted: methodUsed
+          });
+        }
         try {
           methodUsed = 'addBooking';
           const simplePayload = {
@@ -478,6 +526,15 @@ app.post('/api/create-booking', async (req, res) => {
           };
           bookingResp = await callAdminRpc(token, 'addBooking', [simplePayload]);
         } catch (e3) {
+          lastError = e3;
+          if (e3.message.includes('Access denied')) {
+            return res.status(403).json({ 
+              success: false, 
+              error: 'SimplyBook API access denied. Your API key may not have booking permissions.',
+              details: 'Check your SimplyBook dashboard API settings and ensure booking permissions are enabled.',
+              method_attempted: methodUsed
+            });
+          }
           try {
             methodUsed = 'bookEvent';
             const simplePayload = {
@@ -488,6 +545,15 @@ app.post('/api/create-booking', async (req, res) => {
             };
             bookingResp = await callAdminRpc(token, 'bookEvent', [simplePayload]);
           } catch (e4) {
+            lastError = e4;
+            if (e4.message.includes('Access denied')) {
+              return res.status(403).json({ 
+                success: false, 
+                error: 'SimplyBook API access denied. Your API key may not have booking permissions.',
+                details: 'Check your SimplyBook dashboard API settings and ensure booking permissions are enabled.',
+                method_attempted: methodUsed
+              });
+            }
             try {
               methodUsed = 'book';
               const minimalPayload = {
@@ -497,7 +563,12 @@ app.post('/api/create-booking', async (req, res) => {
               bookingResp = await callAdminRpc(token, 'book', [minimalPayload]);
             } catch (e5) {
               console.error('All booking methods failed. Last error:', e5.message);
-              throw e5;
+              return res.status(500).json({ 
+                success: false, 
+                error: 'All booking methods failed',
+                details: lastError.message,
+                methods_tried: ['bookSession', 'createBooking', 'addBooking', 'bookEvent', 'book']
+              });
             }
           }
         }
