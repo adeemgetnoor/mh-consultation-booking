@@ -175,19 +175,7 @@ async function callAdminRpc(token, method, params = [], timeout = 15000) {
     'X-Token': token
   };
 
-  // Add signature if secret key is available
-  if (SIMPLYBOOK_CONFIG.apiSecret) {
-    const crypto = require('crypto');
-    const timestamp = Math.floor(Date.now() / 1000);
-    const signature = crypto
-      .createHmac('sha256', SIMPLYBOOK_CONFIG.apiSecret)
-      .update(`${timestamp}${JSON.stringify(payload)}`)
-      .digest('hex');
-    
-    headers['X-Signature'] = signature;
-    headers['X-Timestamp'] = timestamp.toString();
-  }
-
+  // Try without signature first (SimplyBook might not use HMAC)
   const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/admin`, payload, {
     headers,
     timeout
@@ -439,6 +427,12 @@ app.post('/api/create-booking', async (req, res) => {
 
     if (!clientId) {
       try {
+        console.log('Attempting to create client with data:', {
+          name: clientData.full_name,
+          email: clientData.email,
+          phone: clientData.phone
+        });
+        
         const clientResp = await axios.post(`${adminBase}/clients`, {
           name: clientData.full_name,
           email: clientData.email,
@@ -447,10 +441,23 @@ app.post('/api/create-booking', async (req, res) => {
           headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token, 'Content-Type': 'application/json' },
           timeout: 15000
         });
+        
+        console.log('Client creation response:', {
+          status: clientResp.status,
+          data: clientResp.data,
+          headers: clientResp.headers
+        });
+        
         const clientDataResp = clientResp.data && clientResp.data.id ? clientResp.data : (clientResp.data.result || clientResp.data.client || clientResp.data);
         clientId = clientDataResp.id;
+        console.log('Extracted client ID:', clientId);
       } catch (clientError) {
-        console.error('Client creation failed:', clientError.response?.data || clientError.message);
+        console.error('Client creation failed:', {
+          error: clientError.message,
+          response: clientError.response?.data,
+          status: clientError.response?.status,
+          headers: clientError.response?.headers
+        });
         return res.status(500).json({ 
           success: false, 
           error: 'Failed to create client in SimplyBook',
