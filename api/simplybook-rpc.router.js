@@ -1,3 +1,4 @@
+// simplybook-rpc.router.js
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -14,25 +15,53 @@ let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
 
 async function getTokenCached() {
   const now = Date.now();
-  if (tokenCache.token && now - tokenCache.fetchedAt < tokenCache.ttlMs) return tokenCache.token;
-  const payload = { jsonrpc: '2.0', method: 'getToken', params: [COMPANY, API_KEY], id: 1 };
-  const resp = await axios.post(`${API_URL}/login`, payload, { headers: { 'Content-Type': 'application/json' }, timeout: 15000 });
-  if (!resp.data || !resp.data.result) throw new Error('No token received from SimplyBook getToken');
-  tokenCache = { token: resp.data.result, fetchedAt: Date.now(), ttlMs: tokenCache.ttlMs };
+  if (tokenCache.token && now - tokenCache.fetchedAt < tokenCache.ttlMs) {
+    return tokenCache.token;
+  }
+
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'getToken',
+    params: [COMPANY, API_KEY],
+    id: 1
+  };
+
+  const resp = await axios.post(`${API_URL}/login`, payload, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 15000
+  });
+
+  if (!resp.data || !resp.data.result) {
+    throw new Error('No token received from SimplyBook getToken');
+  }
+
+  tokenCache = {
+    token: resp.data.result,
+    fetchedAt: Date.now(),
+    ttlMs: tokenCache.ttlMs
+  };
+
   return tokenCache.token;
 }
 
 async function rpcCall(method, params = [], timeout = 15000) {
   const token = await getTokenCached();
   const payload = { jsonrpc: '2.0', method, params, id: 1 };
+
   const resp = await axios.post(API_URL, payload, {
-    headers: { 'Content-Type': 'application/json', 'X-Company-Login': COMPANY, 'X-Token': token },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Company-Login': COMPANY,
+      'X-Token': token
+    },
     timeout
   });
+
   if (resp.data && resp.data.error) {
     const err = resp.data.error;
     throw new Error(`${method} error ${err.code || ''}: ${err.message || JSON.stringify(err)}`);
   }
+
   return resp.data?.result;
 }
 
@@ -40,6 +69,7 @@ function md5(s) {
   return crypto.createHash('md5').update(s).digest('hex');
 }
 
+// ---- Simple raw services via getEventList (admin) ----
 router.get('/services', async (req, res) => {
   try {
     const result = await rpcCall('getEventList', []);
@@ -49,6 +79,7 @@ router.get('/services', async (req, res) => {
   }
 });
 
+// ---- Normalized services list ----
 router.get('/services-list', async (req, res) => {
   try {
     const result = await rpcCall('getEventList', []);
@@ -58,27 +89,51 @@ router.get('/services-list', async (req, res) => {
       const name = s.name || '';
       const description = s.description || s.short_description || '';
       const duration = s.duration != null ? parseInt(s.duration, 10) : null;
-      const price = s.price_with_tax != null ? Number(s.price_with_tax) : (s.price != null ? Number(s.price) : null);
+      const price = s.price_with_tax != null
+        ? Number(s.price_with_tax)
+        : (s.price != null ? Number(s.price) : null);
       const currency = s.currency || null;
       const rawPath = s.picture_path || null;
-      const image_url = rawPath ? (rawPath.startsWith('http') ? rawPath : `${API_URL}${rawPath}`) : null;
+      const image_url = rawPath
+        ? (rawPath.startsWith('http') ? rawPath : `${API_URL}${rawPath}`)
+        : null;
       const is_public = s.is_public === '1' || s.is_public === 1 || s.is_public === true;
       const is_active = s.is_active === '1' || s.is_active === 1 || s.is_active === true;
       const categories = Array.isArray(s.categories) ? s.categories : [];
       const providers = Array.isArray(s.providers) ? s.providers : [];
-      return { id, name, description, duration, price, currency, image_url, is_public, is_active, categories, providers, raw: s };
+
+      return {
+        id,
+        name,
+        description,
+        duration,
+        price,
+        currency,
+        image_url,
+        is_public,
+        is_active,
+        categories,
+        providers,
+        raw: s
+      };
     });
+
     const onlyActive = req.query.active === 'true';
     const onlyPublic = req.query.public === 'true';
     if (onlyActive || onlyPublic) {
-      data = data.filter(d => (!onlyActive || d.is_active) && (!onlyPublic || d.is_public));
+      data = data.filter(d =>
+        (!onlyActive || d.is_active) &&
+        (!onlyPublic || d.is_public)
+      );
     }
+
     return res.json({ ok: true, count: data.length, data });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// ---- Units ----
 router.get('/units', async (req, res) => {
   try {
     const result = await rpcCall('getUnitList', []);
@@ -88,6 +143,7 @@ router.get('/units', async (req, res) => {
   }
 });
 
+// ---- First working day ----
 router.get('/first-working-day', async (req, res) => {
   try {
     const performerId = req.query.performerId ? parseInt(req.query.performerId, 10) : null;
@@ -98,11 +154,14 @@ router.get('/first-working-day', async (req, res) => {
   }
 });
 
+// ---- Work calendar ----
 router.get('/work-calendar', async (req, res) => {
   try {
     const year = parseInt(req.query.year, 10);
     const month = parseInt(req.query.month, 10);
-    if (Number.isNaN(year) || Number.isNaN(month)) return res.status(400).json({ ok: false, error: 'year and month are required integers' });
+    if (Number.isNaN(year) || Number.isNaN(month)) {
+      return res.status(400).json({ ok: false, error: 'year and month are required integers' });
+    }
     const performerId = req.query.performerId ? parseInt(req.query.performerId, 10) : null;
     const result = await rpcCall('getWorkCalendar', [year, month, performerId]);
     return res.json({ ok: true, data: result || {} });
@@ -111,10 +170,13 @@ router.get('/work-calendar', async (req, res) => {
   }
 });
 
+// ---- Start time matrix ----
 router.post('/start-time-matrix', async (req, res) => {
   try {
     const { dateFrom, dateTo, eventId, performerId, count } = req.body || {};
-    if (!dateFrom || !dateTo || !eventId) return res.status(400).json({ ok: false, error: 'dateFrom, dateTo, and eventId are required' });
+    if (!dateFrom || !dateTo || !eventId) {
+      return res.status(400).json({ ok: false, error: 'dateFrom, dateTo, and eventId are required' });
+    }
     const eventIdInt = parseInt(eventId, 10);
     const performerIdInt = performerId != null ? parseInt(performerId, 10) : null;
     const qty = count != null ? parseInt(count, 10) : 1;
@@ -125,10 +187,13 @@ router.post('/start-time-matrix', async (req, res) => {
   }
 });
 
+// ---- Calculate end time ----
 router.post('/calculate-end-time', async (req, res) => {
   try {
     const { startDateTime, eventId, performerId } = req.body || {};
-    if (!startDateTime || !eventId) return res.status(400).json({ ok: false, error: 'startDateTime and eventId are required' });
+    if (!startDateTime || !eventId) {
+      return res.status(400).json({ ok: false, error: 'startDateTime and eventId are required' });
+    }
     const eventIdInt = parseInt(eventId, 10);
     const performerIdInt = performerId != null ? parseInt(performerId, 10) : null;
     const result = await rpcCall('calculateEndTime', [startDateTime, eventIdInt, performerIdInt]);
@@ -138,10 +203,13 @@ router.post('/calculate-end-time', async (req, res) => {
   }
 });
 
+// ---- Additional fields for an event ----
 router.get('/additional-fields', async (req, res) => {
   try {
     const eventId = req.query.eventId ? parseInt(req.query.eventId, 10) : null;
-    if (!eventId) return res.status(400).json({ ok: false, error: 'eventId is required' });
+    if (!eventId) {
+      return res.status(400).json({ ok: false, error: 'eventId is required' });
+    }
     const result = await rpcCall('getAdditionalFields', [eventId]);
     return res.json({ ok: true, data: result || [] });
   } catch (e) {
@@ -149,10 +217,17 @@ router.get('/additional-fields', async (req, res) => {
   }
 });
 
+// ---- Book (admin) ----
 router.post('/book', async (req, res) => {
   try {
     const { eventId, unitId, date, time, clientData, additional, count, batchId } = req.body || {};
-    if (!eventId || !unitId || !date || !time || !clientData) return res.status(400).json({ ok: false, error: 'eventId, unitId, date, time, clientData are required' });
+    if (!eventId || !unitId || !date || !time || !clientData) {
+      return res.status(400).json({
+        ok: false,
+        error: 'eventId, unitId, date, time, clientData are required'
+      });
+    }
+
     const params = [
       parseInt(eventId, 10),
       parseInt(unitId, 10),
@@ -163,7 +238,9 @@ router.post('/book', async (req, res) => {
       count != null ? parseInt(count, 10) : 1,
       batchId || null
     ];
+
     const bookingInfo = await rpcCall('book', params);
+
     let confirmations = [];
     if (bookingInfo?.require_confirm && API_SECRET) {
       for (const b of (bookingInfo.bookings || [])) {
@@ -172,6 +249,7 @@ router.post('/book', async (req, res) => {
         confirmations.push({ bookingId: b.id, result: confirmRes });
       }
     }
+
     return res.json({ ok: true, booking: bookingInfo, confirmations });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });

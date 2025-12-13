@@ -9,11 +9,12 @@ const simplyBookRouter = require('./simplybook-rpc.router');
 const app = express();
 
 /**
- * Environment expectations:
- * - SIMPLYBOOK_COMPANY_LOGIN  (your company login)
- * - SIMPLYBOOK_API_KEY       (your API key shown in SimplyBook; used for getToken)
- * - MOLLIE_API_KEY           (optional, for payments)
- * - CACHE_ADMIN_SECRET       (optional, for forced refresh endpoint)
+ * Env vars required:
+ * SIMPLYBOOK_COMPANY_LOGIN
+ * SIMPLYBOOK_API_KEY
+ * (optional) SIMPLYBOOK_API_SECRET
+ * (optional) MOLLIE_API_KEY
+ * (optional) CACHE_ADMIN_SECRET
  */
 const SIMPLYBOOK_CONFIG = {
   company: process.env.SIMPLYBOOK_COMPANY_LOGIN,
@@ -29,16 +30,29 @@ if (!SIMPLYBOOK_CONFIG.company || !SIMPLYBOOK_CONFIG.apiKey) {
   console.warn('Warning: SimplyBook company or apiKey not set in env.');
 }
 
+// ---------------- Simple caches ----------------
+let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
+let servicesCache = { data: null, fetchedAt: 0, ttlMs: 1000 * 60 * 5 };
+
+// ---------------- Normalizers ----------------
 function normalizeServicesAdmin(items = []) {
   return items.map(s => {
     const id = s.id || s.service_id || null;
     const name = s.name || s.title || '';
     const price = (s.price || s.default_price || s.cost || '') + '';
     const duration = s.duration || s.length || '';
-    const cat = (s.category && (s.category.name || s.category.title)) || s.category_name || s.group_name || 'General';
+    const cat =
+      (s.category && (s.category.name || s.category.title)) ||
+      s.category_name ||
+      s.group_name ||
+      'General';
     let image_url = s.image || s.image_url || s.picture_url || null;
     if (image_url && typeof image_url === 'object') image_url = image_url.url || null;
-    const status = (typeof s.active === 'boolean') ? (s.active ? 'online' : 'offline') : (s.status || 'online');
+    const status =
+      typeof s.active === 'boolean'
+        ? (s.active ? 'online' : 'offline')
+        : (s.status || 'online');
+
     return {
       id,
       name,
@@ -54,232 +68,24 @@ function normalizeServicesAdmin(items = []) {
   });
 }
 
-app.use(express.json());
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // allow server-side requests
-    const allowedOrigins = [
-      'https://maharishiayurveda.de',
-      'https://www.maharishiayurveda.de',
-      'https://maharishi-ayurveda-de.myshopify.com',
-      'https://mh-consultation-booking.vercel.app',
-      'http://localhost:9292',
-      'http://127.0.0.1:9292'
-    ];
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('.myshopify.com')) {
-      return callback(null, true);
-    }
-    console.log('CORS: allowing unknown origin for now (relaxed):', origin);
-    return callback(null, true);
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
-}));
-app.options('*', cors());
-app.use('/api/sb', simplyBookRouter);
-
-// Simple in-memory caches
-let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
-let servicesCache = { data: null, fetchedAt: 0, ttlMs: 1000 * 60 * 5 };
-
-/** getSimplyBookTokenCached
- * Uses JSON-RPC getToken on https://user-api.simplybook.me/login
- */
-async function getSimplyBookTokenCached() {
-  const now = Date.now();
-  if (tokenCache.token && (now - tokenCache.fetchedAt) < tokenCache.ttlMs) {
-    return tokenCache.token;
-  }
-
-  const payload = {
-    jsonrpc: '2.0',
-    method: 'getToken',
-    params: [SIMPLYBOOK_CONFIG.company, SIMPLYBOOK_CONFIG.apiKey],
-    id: 1
-  };
-
-  try {
-    const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/login`, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000
-    });
-    if (!resp.data || !resp.data.result) throw new Error('No token in login response');
-    tokenCache.token = resp.data.result;
-    tokenCache.fetchedAt = Date.now();
-    console.log('Obtained new SimplyBook token (cached).');
-    return tokenCache.token;
-  } catch (err) {
-    console.error('getSimplyBookTokenCached error:', err.response?.data || err.message);
-    throw new Error('Failed to obtain SimplyBook token');
-  }
-}
-
-/**
- * Helper: callAdminRpc
- * Calls the admin RPC endpoint (POST to /admin) with X-Company-Login and X-Token
- */
-async function callAdminRpc(token, method, params = [], timeout = 15000) {
-  const payload = {
-    jsonrpc: '2.0',
-    method,
-    params,
-    id: 1
-  };
-
-  const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/admin`, payload, {
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Company-Login': SIMPLYBOOK_CONFIG.company,
-      'X-Token': token
-    },
-    timeout
-  });
-
-  return resp.data;
-}
-
-/**
- * Helper: callPublicRpc
- * Calls the public RPC endpoint (POST to base apiUrl) — no headers required for public calls
- */
-async function callPublicRpc(method, params = [], timeout = 15000) {
-  const payload = { jsonrpc: '2.0', method, params, id: 1 };
-  const headers = { 'Content-Type': 'application/json' };
-  // Some public RPC methods require specifying company via header
-  if (SIMPLYBOOK_CONFIG.company) headers['X-Company-Login'] = SIMPLYBOOK_CONFIG.company;
-  const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}`, payload, {
-    headers,
-    timeout
-  });
-  return resp.data;
-}
-
-/**
- * fetchServicesCached
- * Primary strategy:
- *  1) Try admin RPC getEventList (requires token). If returns events, normalize & cache.
- *  2) If admin call fails with access denied OR returns no events:
- *     - try public getEventListPublic
- *     - if still nothing, try getServiceListPublic
- */
-async function fetchServicesCached(forceRefresh = false) {
-  const now = Date.now();
-  if (!forceRefresh && servicesCache.data && (now - servicesCache.fetchedAt) < servicesCache.ttlMs) {
-    return servicesCache.data;
-  }
-
-  // Try admin getEventList first
-  try {
-    const token = await getSimplyBookTokenCached();
-    // request for a reasonable date window (today -> +1 year)
-    const from = new Date().toISOString().split('T')[0];
-    const to = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0];
-
-    console.log('Attempting admin getEventList', { from, to });
-    const adminResp = await callAdminRpc(token, 'getEventList', [from, to]);
-    if (adminResp && adminResp.result && Array.isArray(adminResp.result) && adminResp.result.length > 0) {
-      console.log('admin getEventList returned', adminResp.result.length, 'events');
-      const services = normalizeEventsToServices(adminResp.result);
-      servicesCache.data = services;
-      servicesCache.fetchedAt = Date.now();
-      return services;
-    }
-
-    // If adminResp has error (access denied), throw to fall back
-    if (adminResp && adminResp.error) {
-      const code = adminResp.error.code;
-      console.warn('admin getEventList returned error', adminResp.error);
-      if (code === -32600 || String(adminResp.error.message).toLowerCase().includes('access')) {
-        throw new Error('admin_access_denied');
-      }
-    }
-
-    console.log('admin getEventList returned no events -> will try public methods');
-  } catch (err) {
-    console.warn('admin getEventList failed:', err.message || err);
-    // continue to public fallbacks
-  }
-
-  // Fallback: getEventListPublic (public RPC)
-  try {
-    console.log('Trying public getEventListPublic');
-    // Provide a date window like the admin call (today -> +1 year)
-    const from = new Date().toISOString().split('T')[0];
-    const to = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0];
-    const publicResp = await callPublicRpc('getEventListPublic', [from, to]);
-    if (publicResp && publicResp.result && Array.isArray(publicResp.result) && publicResp.result.length > 0) {
-      console.log('getEventListPublic returned', publicResp.result.length, 'events');
-      const services = normalizeEventsToServices(publicResp.result);
-      servicesCache.data = services;
-      servicesCache.fetchedAt = Date.now();
-      return services;
-    }
-    console.log('getEventListPublic returned no events or empty array');
-  } catch (err) {
-    console.warn('getEventListPublic failed:', err.response?.data || err.message);
-  }
-
-  // Last fallback: getServiceListPublic (some accounts expose services via this)
-  try {
-    console.log('Trying public getServiceListPublic');
-    const svcResp = await callPublicRpc('getServiceListPublic', []);
-    if (svcResp && svcResp.result && Array.isArray(svcResp.result) && svcResp.result.length > 0) {
-      console.log('getServiceListPublic returned', svcResp.result.length, 'items');
-      const services = normalizeServicesListPublic(svcResp.result);
-      servicesCache.data = services;
-      servicesCache.fetchedAt = Date.now();
-      return services;
-    }
-    console.log('getServiceListPublic returned no items');
-  } catch (err) {
-    console.warn('getServiceListPublic failed:', err.response?.data || err.message);
-  }
-
-  // Additional fallback: Admin REST /admin/services (requires token)
-  try {
-    console.log('Trying admin REST /admin/services');
-    const token = await getSimplyBookTokenCached();
-    const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
-    const resp = await axios.get(`${adminBase}/services`, {
-      headers: {
-        'X-Company-Login': SIMPLYBOOK_CONFIG.company,
-        'X-Token': token
-      },
-      timeout: 15000
-    });
-    const itemsRaw = Array.isArray(resp.data) ? resp.data : (resp.data.result || resp.data.services || []);
-    if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
-      console.log('/admin/services returned', itemsRaw.length, 'items');
-      const services = normalizeServicesAdmin(itemsRaw);
-      servicesCache.data = services;
-      servicesCache.fetchedAt = Date.now();
-      return services;
-    }
-    console.log('/admin/services returned no items');
-  } catch (err) {
-    console.warn('Admin REST /admin/services failed:', err.response?.data || err.message);
-  }
-
-  // Nothing found
-  throw new Error('Failed to fetch services from SimplyBook (no events returned by getEventList/getEventListPublic/getServiceListPublic).');
-}
-
-/**
- * Normalizers
- * convert different RPC shapes into a uniform service object:
- * { id, name, description, price, duration, category_name, image_url, status, raw }
- */
 function normalizeEventsToServices(events = []) {
   return events.map(e => {
-    // event shape varies across accounts; pick best-guess fields
     const name = e.name || e.title || e.service_name || e.event_name || '';
     const id = e.id || e.event_id || e.service_id || null;
     const duration = e.duration || e.length || e.duration_minutes || e.event_duration || '';
     const price = (e.price || e.cost || (e.pricing && e.pricing.price) || '') + '';
-    const cat = e.unit_group_name || e.category || e.category_name || e.group_name || (e.location || '') || 'General';
+    const cat =
+      e.unit_group_name ||
+      e.category ||
+      e.category_name ||
+      e.group_name ||
+      (e.location || '') ||
+      'General';
+
     let image_url = null;
-    if (e.image) image_url = (typeof e.image === 'string') ? e.image : (e.image.url || null);
+    if (e.image) {
+      image_url = typeof e.image === 'string' ? e.image : (e.image.url || null);
+    }
     image_url = image_url || e.image_url || e.picture_url || null;
 
     const description = e.description || e.long_description || e.details || e.text || '';
@@ -309,6 +115,7 @@ function normalizeServicesListPublic(items = []) {
     const cat = s.category_name || s.group_name || 'General';
     let image_url = s.image || s.image_url || s.picture_url || null;
     if (image_url && typeof image_url === 'object') image_url = image_url.url || null;
+
     return {
       id,
       name,
@@ -324,6 +131,188 @@ function normalizeServicesListPublic(items = []) {
   });
 }
 
+// ---------------- Token + RPC helpers ----------------
+async function getSimplyBookTokenCached() {
+  const now = Date.now();
+  if (tokenCache.token && (now - tokenCache.fetchedAt) < tokenCache.ttlMs) {
+    return tokenCache.token;
+  }
+
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'getToken',
+    params: [SIMPLYBOOK_CONFIG.company, SIMPLYBOOK_CONFIG.apiKey],
+    id: 1
+  };
+
+  try {
+    const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/login`, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000
+    });
+
+    if (!resp.data || !resp.data.result) {
+      throw new Error('No token in login response');
+    }
+
+    tokenCache.token = resp.data.result;
+    tokenCache.fetchedAt = Date.now();
+    console.log('Obtained new SimplyBook token (cached).');
+    return tokenCache.token;
+  } catch (err) {
+    console.error('getSimplyBookTokenCached error:', err.response?.data || err.message);
+    throw new Error('Failed to obtain SimplyBook token');
+  }
+}
+
+async function callAdminRpc(token, method, params = [], timeout = 15000) {
+  const payload = { jsonrpc: '2.0', method, params, id: 1 };
+
+  const resp = await axios.post(`${SIMPLYBOOK_CONFIG.apiUrl}/admin`, payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Company-Login': SIMPLYBOOK_CONFIG.company,
+      'X-Token': token
+    },
+    timeout
+  });
+
+  return resp.data;
+}
+
+async function callPublicRpc(method, params = [], timeout = 15000) {
+  const payload = { jsonrpc: '2.0', method, params, id: 1 };
+  const headers = { 'Content-Type': 'application/json' };
+  if (SIMPLYBOOK_CONFIG.company) headers['X-Company-Login'] = SIMPLYBOOK_CONFIG.company;
+
+  const resp = await axios.post(SIMPLYBOOK_CONFIG.apiUrl, payload, {
+    headers,
+    timeout
+  });
+
+  return resp.data;
+}
+
+// ---------------- Fetch services only from SimplyBook ----------------
+async function fetchServicesCached(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && servicesCache.data && (now - servicesCache.fetchedAt) < servicesCache.ttlMs) {
+    return servicesCache.data;
+  }
+
+  // 1) Admin getEventList
+  try {
+    const token = await getSimplyBookTokenCached();
+    const adminResp = await callAdminRpc(token, 'getEventList', []);
+
+    if (adminResp && adminResp.result) {
+      const raw = Array.isArray(adminResp.result)
+        ? adminResp.result
+        : Object.values(adminResp.result);
+      if (raw.length > 0) {
+        console.log('admin getEventList returned', raw.length, 'items');
+        const services = normalizeEventsToServices(raw);
+        servicesCache.data = services;
+        servicesCache.fetchedAt = Date.now();
+        return services;
+      }
+    }
+
+    if (adminResp && adminResp.error) {
+      console.warn('admin getEventList error:', adminResp.error);
+    }
+  } catch (err) {
+    console.warn('admin getEventList failed:', err.message || err);
+  }
+
+  // 2) Public getEventListPublic
+  try {
+    const from = new Date().toISOString().split('T')[0];
+    const to = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0];
+    const publicResp = await callPublicRpc('getEventListPublic', [from, to]);
+    if (publicResp && publicResp.result && Array.isArray(publicResp.result) && publicResp.result.length > 0) {
+      console.log('getEventListPublic returned', publicResp.result.length, 'events');
+      const services = normalizeEventsToServices(publicResp.result);
+      servicesCache.data = services;
+      servicesCache.fetchedAt = Date.now();
+      return services;
+    }
+  } catch (err) {
+    console.warn('getEventListPublic failed:', err.response?.data || err.message);
+  }
+
+  // 3) Public getServiceListPublic
+  try {
+    const svcResp = await callPublicRpc('getServiceListPublic', []);
+    if (svcResp && svcResp.result && Array.isArray(svcResp.result) && svcResp.result.length > 0) {
+      console.log('getServiceListPublic returned', svcResp.result.length, 'items');
+      const services = normalizeServicesListPublic(svcResp.result);
+      servicesCache.data = services;
+      servicesCache.fetchedAt = Date.now();
+      return services;
+    }
+  } catch (err) {
+    console.warn('getServiceListPublic failed:', err.response?.data || err.message);
+  }
+
+  // 4) Admin REST /admin/services
+  try {
+    const token = await getSimplyBookTokenCached();
+    const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
+    const resp = await axios.get(`${adminBase}/services`, {
+      headers: {
+        'X-Company-Login': SIMPLYBOOK_CONFIG.company,
+        'X-Token': token
+      },
+      timeout: 15000
+    });
+
+    const itemsRaw = Array.isArray(resp.data)
+      ? resp.data
+      : (resp.data.result || resp.data.services || []);
+
+    if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
+      console.log('/admin/services returned', itemsRaw.length, 'items');
+      const services = normalizeServicesAdmin(itemsRaw);
+      servicesCache.data = services;
+      servicesCache.fetchedAt = Date.now();
+      return services;
+    }
+  } catch (err) {
+    console.warn('/admin/services failed:', err.response?.data || err.message);
+  }
+
+  throw new Error('Failed to fetch services from SimplyBook (no methods returned data).');
+}
+
+app.use(express.json());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    const allowedOrigins = [
+      'https://maharishiayurveda.de',
+      'https://www.maharishiayurveda.de',
+      'https://maharishi-ayurveda-de.myshopify.com',
+      'https://mh-consultation-booking.vercel.app',
+      'http://localhost:9292',
+      'http://127.0.0.1:9292'
+    ];
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('.myshopify.com')) {
+      return callback(null, true);
+    }
+    console.log('CORS relaxed for origin:', origin);
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
+app.options('*', cors());
+app.use('/api/sb', simplyBookRouter);
+
+// Simple in-memory caches
+
+
 // -------------------------
 // Routes
 // -------------------------
@@ -333,10 +322,9 @@ app.get('/', (req, res) => {
     status: 'running',
     endpoints: {
       health: '/api/health',
-      getSlots: '/api/get-slots',
-      createBooking: '/api/create-booking',
-      createPayment: '/api/create-payment',
-      services: '/api/services'
+      services: '/api/services',
+      sb_services: '/api/sb/services',
+      sb_services_list: '/api/sb/services-list'
     }
   });
 });
@@ -345,25 +333,23 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Booking API running', timestamp: new Date().toISOString() });
 });
 
-/**
- * GET /api/services
- * Query: ?force=true to bypass cache (protected in prod by x-cache-admin-secret)
- */
+// Main endpoint the frontend will call: returns normalized services from SimplyBook
 app.get('/api/services', async (req, res) => {
   try {
     const force = req.query.force === 'true';
-    if (force && process.env.NODE_ENV === 'production') {
-      const secret = req.headers['x-cache-admin-secret'] || req.query.admin_secret;
-      if (!process.env.CACHE_ADMIN_SECRET || secret !== process.env.CACHE_ADMIN_SECRET) {
-        return res.status(401).json({ ok: false, error: 'Unauthorized to force refresh cache' });
-      }
-    }
-
     const services = await fetchServicesCached(force);
-    return res.json({ ok: true, fetched_at: new Date().toISOString(), count: services.length, data: services });
+    return res.json({
+      ok: true,
+      fetched_at: new Date().toISOString(),
+      count: services.length,
+      data: services
+    });
   } catch (err) {
     console.error('/api/services error:', err.message || err);
-    return res.status(500).json({ ok: false, error: err.message || 'Failed to fetch services from SimplyBook' });
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'Failed to fetch services from SimplyBook'
+    });
   }
 });
 
