@@ -431,11 +431,12 @@ app.post('/api/create-booking', async (req, res) => {
       clientId = clientDataResp.id;
     }
 
-    // create booking
-    const bookingResp = await axios.post(`${adminBase}/bookings`, {
+    // create booking using RPC
+    const bookingPayload = {
       service_id: parseInt(serviceId, 10),
       client_id: parseInt(clientId, 10),
-      datetime,
+      start_datetime: datetime,
+      end_datetime: new Date(new Date(datetime).getTime() + 60 * 60 * 1000).toISOString(), // +1 hour
       additional_fields: {
         city: clientData.city || '',
         country: clientData.country || '',
@@ -445,10 +446,10 @@ app.post('/api/create-booking', async (req, res) => {
         hear_about: clientData.hear_about || '',
         consultation_package: clientData.consultation_package || ''
       }
-    }, {
-      headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token, 'Content-Type': 'application/json' },
-      timeout: 15000
-    });
+    };
+
+    console.log('Creating booking with payload:', bookingPayload);
+    const bookingResp = await callAdminRpc(token, 'bookSession', [bookingPayload]);
 
     return res.json({ success: true, booking: bookingResp.data, message: 'Booking created successfully' });
   } catch (error) {
