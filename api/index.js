@@ -333,48 +333,6 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Booking API running', timestamp: new Date().toISOString() });
 });
 
-// Test endpoint for booking API connectivity
-app.post('/api/test-booking', async (req, res) => {
-  try {
-    console.log('Test booking endpoint hit with body:', req.body);
-    return res.json({ success: true, message: 'API connectivity test successful', received: req.body });
-  } catch (error) {
-    console.error('Test booking error:', error.message);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Test SimplyBook API connection
-app.get('/api/test-simplybook', async (req, res) => {
-  try {
-    console.log('=== TESTING SIMPLYBOOK API CONNECTION ===');
-    console.log('Company:', SIMPLYBOOK_CONFIG.company);
-    console.log('API Key set:', !!SIMPLYBOOK_CONFIG.apiKey);
-    
-    const token = await getSimplyBookTokenCached();
-    console.log('Token obtained successfully');
-    
-    // Test a simple RPC call
-    const testResp = await callAdminRpc(token, 'getEventList', []);
-    console.log('Test RPC call successful, result count:', Array.isArray(testResp) ? testResp.length : 'not array');
-    
-    return res.json({ 
-      success: true, 
-      message: 'SimplyBook API connection successful',
-      token_obtained: !!token,
-      test_call_successful: !!testResp,
-      result_count: Array.isArray(testResp) ? testResp.length : 0
-    });
-  } catch (error) {
-    console.error('SimplyBook API test failed:', error.message);
-    return res.status(500).json({ 
-      success: false, 
-      error: error.message,
-      company: SIMPLYBOOK_CONFIG.company,
-      api_key_set: !!SIMPLYBOOK_CONFIG.apiKey
-    });
-  }
-});
 
 // Main endpoint the frontend will call: returns normalized services from SimplyBook
 app.get('/api/services', async (req, res) => {
@@ -441,44 +399,29 @@ app.post('/api/get-slots', async (req, res) => {
 // Create Booking (admin bookings)
 app.post('/api/create-booking', async (req, res) => {
   try {
-    console.log('=== BOOKING ATTEMPT START ===');
     const { serviceId, datetime, clientData } = req.body;
-    console.log('Received booking data:', { serviceId, datetime, clientData });
-    
     if (!serviceId || !datetime || !clientData) {
-      console.log('Missing required data:', { serviceId: !!serviceId, datetime: !!datetime, clientData: !!clientData });
       return res.status(400).json({ success: false, error: 'Missing required booking data' });
     }
 
-    console.log('Getting SimplyBook token...');
     const token = await getSimplyBookTokenCached();
-    console.log('Token obtained successfully');
-    
     const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
-    console.log('Admin base URL:', adminBase);
 
     // try to find existing client
     let clientId;
     try {
-      console.log('Looking for existing client with email:', clientData.email);
       const existingClientResp = await axios.get(`${adminBase}/clients`, {
         headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token },
         params: { email: clientData.email },
         timeout: 15000
       });
       const clientsRaw = Array.isArray(existingClientResp.data) ? existingClientResp.data : (existingClientResp.data.result || existingClientResp.data.clients || []);
-      if (Array.isArray(clientsRaw) && clientsRaw.length > 0) {
-        clientId = clientsRaw[0].id;
-        console.log('Found existing client:', clientId);
-      } else {
-        console.log('No existing client found');
-      }
+      if (Array.isArray(clientsRaw) && clientsRaw.length > 0) clientId = clientsRaw[0].id;
     } catch (e) {
-      console.warn('Client lookup failed, will create new:', e.response?.data || e.message);
+      // Client lookup failed, will create new
     }
 
     if (!clientId) {
-      console.log('Creating new client...');
       const clientResp = await axios.post(`${adminBase}/clients`, {
         name: clientData.full_name,
         email: clientData.email,
@@ -489,7 +432,6 @@ app.post('/api/create-booking', async (req, res) => {
       });
       const clientDataResp = clientResp.data && clientResp.data.id ? clientResp.data : (clientResp.data.result || clientResp.data.client || clientResp.data);
       clientId = clientDataResp.id;
-      console.log('Created new client with ID:', clientId);
     }
 
     // create booking using RPC
@@ -497,7 +439,7 @@ app.post('/api/create-booking', async (req, res) => {
       service_id: parseInt(serviceId, 10),
       client_id: parseInt(clientId, 10),
       start_datetime: datetime,
-      end_datetime: new Date(new Date(datetime).getTime() + 60 * 60 * 1000).toISOString(), // +1 hour
+      end_datetime: new Date(new Date(datetime).getTime() + 60 * 60 * 1000).toISOString(),
       additional_fields: {
         city: clientData.city || '',
         country: clientData.country || '',
@@ -509,22 +451,11 @@ app.post('/api/create-booking', async (req, res) => {
       }
     };
 
-    console.log('Creating booking with payload:', bookingPayload);
-    console.log('Service ID:', serviceId, 'Client ID:', clientId, 'Datetime:', datetime);
-    
     let bookingResp;
-    let lastError;
-    
     try {
-      console.log('Trying bookSession method...');
       bookingResp = await callAdminRpc(token, 'bookSession', [bookingPayload]);
-      console.log('bookSession successful:', bookingResp);
     } catch (e1) {
-      console.warn('bookSession failed:', e1.message);
-      lastError = e1;
       try {
-        console.log('Trying createBooking method...');
-        // Try different payload format
         const simplePayload = {
           service_id: bookingPayload.service_id,
           client_id: bookingPayload.client_id,
@@ -532,12 +463,8 @@ app.post('/api/create-booking', async (req, res) => {
           end_datetime: bookingPayload.end_datetime
         };
         bookingResp = await callAdminRpc(token, 'createBooking', [simplePayload]);
-        console.log('createBooking successful:', bookingResp);
       } catch (e2) {
-        console.warn('createBooking failed:', e2.message);
-        lastError = e2;
         try {
-          console.log('Trying addBooking method...');
           const simplePayload = {
             service_id: bookingPayload.service_id,
             client_id: bookingPayload.client_id,
@@ -545,12 +472,8 @@ app.post('/api/create-booking', async (req, res) => {
             end_datetime: bookingPayload.end_datetime
           };
           bookingResp = await callAdminRpc(token, 'addBooking', [simplePayload]);
-          console.log('addBooking successful:', bookingResp);
         } catch (e3) {
-          console.warn('addBooking failed:', e3.message);
-          lastError = e3;
           try {
-            console.log('Trying bookEvent method...');
             const simplePayload = {
               service_id: bookingPayload.service_id,
               client_id: bookingPayload.client_id,
@@ -558,32 +481,20 @@ app.post('/api/create-booking', async (req, res) => {
               end_datetime: bookingPayload.end_datetime
             };
             bookingResp = await callAdminRpc(token, 'bookEvent', [simplePayload]);
-            console.log('bookEvent successful:', bookingResp);
           } catch (e4) {
-            console.warn('bookEvent failed:', e4.message);
-            lastError = e4;
-            
-            // Try one more method - just service and datetime
             try {
-              console.log('Trying minimal booking method...');
               const minimalPayload = {
                 service_id: bookingPayload.service_id,
                 start_datetime: bookingPayload.start_datetime
               };
               bookingResp = await callAdminRpc(token, 'book', [minimalPayload]);
-              console.log('book method successful:', bookingResp);
             } catch (e5) {
-              console.error('All booking methods failed, last error:', e5.message);
-              console.error('Complete error details:', lastError);
-              throw lastError || e5;
+              throw e5;
             }
           }
         }
       }
     }
-
-    console.log('=== BOOKING SUCCESSFUL ===');
-    console.log('Booking response:', bookingResp);
 
     return res.json({ success: true, booking: bookingResp.data, message: 'Booking created successfully' });
   } catch (error) {
