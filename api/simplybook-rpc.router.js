@@ -49,6 +49,36 @@ router.get('/services', async (req, res) => {
   }
 });
 
+router.get('/services-list', async (req, res) => {
+  try {
+    const result = await rpcCall('getEventList', []);
+    const items = Array.isArray(result) ? result : Object.values(result || {});
+    let data = items.map(s => {
+      const id = s.id != null ? parseInt(s.id, 10) : null;
+      const name = s.name || '';
+      const description = s.description || s.short_description || '';
+      const duration = s.duration != null ? parseInt(s.duration, 10) : null;
+      const price = s.price_with_tax != null ? Number(s.price_with_tax) : (s.price != null ? Number(s.price) : null);
+      const currency = s.currency || null;
+      const rawPath = s.picture_path || null;
+      const image_url = rawPath ? (rawPath.startsWith('http') ? rawPath : `${API_URL}${rawPath}`) : null;
+      const is_public = s.is_public === '1' || s.is_public === 1 || s.is_public === true;
+      const is_active = s.is_active === '1' || s.is_active === 1 || s.is_active === true;
+      const categories = Array.isArray(s.categories) ? s.categories : [];
+      const providers = Array.isArray(s.providers) ? s.providers : [];
+      return { id, name, description, duration, price, currency, image_url, is_public, is_active, categories, providers, raw: s };
+    });
+    const onlyActive = req.query.active === 'true';
+    const onlyPublic = req.query.public === 'true';
+    if (onlyActive || onlyPublic) {
+      data = data.filter(d => (!onlyActive || d.is_active) && (!onlyPublic || d.is_public));
+    }
+    return res.json({ ok: true, count: data.length, data });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 router.get('/units', async (req, res) => {
   try {
     const result = await rpcCall('getUnitList', []);
