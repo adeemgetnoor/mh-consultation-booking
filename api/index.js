@@ -307,10 +307,27 @@ async function createSimplyBookBooking({ serviceId, performerId, datetime, clien
     clientId = clientDataResp.id;
   }
 
-  // Parse datetime to get date and time components
-  const datetimeObj = new Date(datetime);
-  const startDate = datetimeObj.toISOString().split('T')[0];
-  const startTime = datetimeObj.toTimeString().split(' ')[0].substring(0, 5);
+  // Derive start_date/start_time in a timezone-safe way.
+  // If datetime is provided as an ISO-like string (YYYY-MM-DDTHH:MM...), prefer slicing
+  // instead of Date() conversions (which can shift the day/time due to timezone).
+  let startDate;
+  let startTime;
+  if (typeof datetime === 'string') {
+    const m = datetime.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})/);
+    if (m) {
+      startDate = m[1];
+      startTime = m[2];
+    }
+  }
+  if (!startDate || !startTime) {
+    const datetimeObj = new Date(datetime);
+    if (Number.isNaN(datetimeObj.getTime())) {
+      throw new Error('Invalid datetime provided');
+    }
+    const iso = datetimeObj.toISOString();
+    startDate = iso.split('T')[0];
+    startTime = iso.split('T')[1].substring(0, 5);
+  }
 
   const bookingPayload = {
     service_id: parseInt(serviceId, 10),
