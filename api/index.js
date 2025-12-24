@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 const { createMollieClient } = require('@mollie/api-client');
 const simplyBookRouter = require('./simplybook-rpc.router');
 
@@ -22,6 +23,8 @@ const SIMPLYBOOK_CONFIG = {
   apiUrl: 'https://user-api.simplybook.me' // base url used by login and admin endpoints
 };
 
+const SIMPLYBOOK_API_SECRET = process.env.SIMPLYBOOK_API_SECRET || '';
+
 const mollieClient = createMollieClient({
   apiKey: process.env.MOLLIE_API_KEY || ''
 });
@@ -34,24 +37,22 @@ if (!SIMPLYBOOK_CONFIG.company || !SIMPLYBOOK_CONFIG.apiKey) {
 let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
 let servicesCache = { data: null, fetchedAt: 0, ttlMs: 1000 * 60 * 5 };
 
+// ---------------- Mollie in-memory state ----------------
+// NOTE: in-memory only; use a DB for production so data survives restarts.
+const pendingBookingsByPaymentId = new Map();
+const processedPayments = new Set();
+
 // ---------------- Normalizers ----------------
 function normalizeServicesAdmin(items = []) {
   return items.map(s => {
     const id = s.id || s.service_id || null;
     const name = s.name || s.title || '';
-    const price = (s.price || s.default_price || s.cost || '') + '';
+    const price = (s.price || s.cost || '') + '';
     const duration = s.duration || s.length || '';
-    const cat =
-      (s.category && (s.category.name || s.category.title)) ||
-      s.category_name ||
-      s.group_name ||
-      'General';
+    const cat = (s.category && (s.category.name || s.category.title)) || s.category_name || s.group_name || 'General';
     let image_url = s.image || s.image_url || s.picture_url || null;
     if (image_url && typeof image_url === 'object') image_url = image_url.url || null;
-    const status =
-      typeof s.active === 'boolean'
-        ? (s.active ? 'online' : 'offline')
-        : (s.status || 'online');
+    const status = typeof s.active === 'boolean' ? (s.active ? 'online' : 'offline') : (s.status || 'online');
 
     // Extract available time information
     const available_time = {
@@ -100,13 +101,7 @@ function normalizeEventsToServices(events = []) {
     const id = e.id || e.event_id || e.service_id || null;
     const duration = e.duration || e.length || e.duration_minutes || e.event_duration || '';
     const price = (e.price || e.cost || (e.pricing && e.pricing.price) || '') + '';
-    const cat =
-      e.unit_group_name ||
-      e.category ||
-      e.category_name ||
-      e.group_name ||
-      (e.location || '') ||
-      'General';
+    const cat = e.unit_group_name || e.category || e.category_name || e.group_name || (e.location || '') || 'General';
 
     let image_url = null;
     if (e.image) {
@@ -258,6 +253,136 @@ async function callAdminRpc(token, method, params = [], timeout = 15000) {
   return resp.data;
 }
 
+function md5(s) {
+  return crypto.createHash('md5').update(s).digest('hex');
+}
+
+async function confirmSimplyBookBookingIfRequired(token, bookingResp) {
+  const result = bookingResp?.result;
+  if (!result?.require_confirm || !SIMPLYBOOK_API_SECRET) return [];
+
+  const bookings = Array.isArray(result.bookings) ? result.bookings : [];
+  const confirmations = [];
+  for (const b of bookings) {
+    if (!b?.id || !b?.hash) continue;
+    const sign = md5(`${b.id}${b.hash}${SIMPLYBOOK_API_SECRET}`);
+    const confirmResp = await callAdminRpc(token, 'confirmBooking', [b.id, sign]);
+    confirmations.push({ bookingId: b.id, confirmResp });
+  }
+  return confirmations;
+}
+
+async function createSimplyBookBooking({ serviceId, performerId, datetime, clientData, additionalFields }) {
+  if (!serviceId || !datetime || !clientData) {
+    throw new Error('Missing required booking data');
+  }
+
+  const token = await getSimplyBookTokenCached();
+  const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
+
+  // try to find existing client
+  let clientId;
+  try {
+    const existingClientResp = await axios.get(`${adminBase}/clients`, {
+      headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token },
+      params: { email: clientData.email },
+      timeout: 15000
+    });
+    const clientsRaw = Array.isArray(existingClientResp.data) ? existingClientResp.data : (existingClientResp.data.result || existingClientResp.data.clients || []);
+    if (Array.isArray(clientsRaw) && clientsRaw.length > 0) clientId = clientsRaw[0].id;
+  } catch (e) {
+    // Client lookup failed, will create new
+  }
+
+  if (!clientId) {
+    const clientResp = await axios.post(`${adminBase}/clients`, {
+      name: clientData.full_name,
+      email: clientData.email,
+      phone: clientData.phone
+    }, {
+      headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token, 'Content-Type': 'application/json' },
+      timeout: 15000
+    });
+    const clientDataResp = clientResp.data && clientResp.data.id ? clientResp.data : (clientResp.data.result || clientResp.data.client || clientResp.data);
+    clientId = clientDataResp.id;
+  }
+
+  // Parse datetime to get date and time components
+  const datetimeObj = new Date(datetime);
+  const startDate = datetimeObj.toISOString().split('T')[0];
+  const startTime = datetimeObj.toTimeString().split(' ')[0].substring(0, 5);
+
+  const bookingPayload = {
+    service_id: parseInt(serviceId, 10),
+    unit_id: performerId ? parseInt(performerId, 10) : null,
+    start_date: startDate,
+    start_time: startTime,
+    client_data: {
+      name: clientData.full_name,
+      email: clientData.email,
+      phone: clientData.phone
+    },
+    additional_fields: additionalFields || {
+      city: clientData.city || '',
+      country: clientData.country || '',
+      wellness_priority: clientData.wellness_priority || '',
+      consultation_type: clientData.consultation_type || 'in-person',
+      translator: clientData.translator || 'no',
+      hear_about: clientData.hear_about || '',
+      consultation_package: clientData.consultation_package || '',
+      location_name: clientData.location_name || '',
+      location_address: clientData.location_address || '',
+      online_meeting: clientData.online_meeting || false,
+      meeting_url: clientData.meeting_url || '',
+      preferred_time_slot: startTime,
+      booking_timezone: clientData.timezone || 'UTC'
+    },
+    count: 1
+  };
+
+  let bookingResp;
+  try {
+    bookingResp = await callAdminRpc(token, 'book', [
+      bookingPayload.service_id,
+      bookingPayload.unit_id,
+      bookingPayload.start_date,
+      bookingPayload.start_time,
+      bookingPayload.client_data,
+      bookingPayload.additional_fields,
+      bookingPayload.count
+    ]);
+  } catch (e1) {
+    try {
+      const fallbackPayload = {
+        service_id: bookingPayload.service_id,
+        client_id: parseInt(clientId, 10),
+        start_datetime: datetime,
+        end_datetime: new Date(new Date(datetime).getTime() + 60 * 60 * 1000).toISOString(),
+        additional_fields: bookingPayload.additional_fields
+      };
+      bookingResp = await callAdminRpc(token, 'bookSession', [fallbackPayload]);
+    } catch (e2) {
+      throw e2;
+    }
+  }
+
+  const confirmations = await confirmSimplyBookBookingIfRequired(token, bookingResp);
+  return {
+    bookingResp,
+    confirmations,
+    booking_details: {
+      service_id: serviceId,
+      performer_id: performerId,
+      start_date: startDate,
+      start_time: startTime,
+      client_info: {
+        name: clientData.full_name,
+        email: clientData.email
+      }
+    }
+  };
+}
+
 async function callPublicRpc(method, params = [], timeout = 15000) {
   const payload = { jsonrpc: '2.0', method, params, id: 1 };
   const headers = { 'Content-Type': 'application/json' };
@@ -364,6 +489,7 @@ async function fetchServicesCached(forceRefresh = false) {
 }
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
@@ -390,7 +516,6 @@ app.use('/api/sb', simplyBookRouter);
 
 // Simple in-memory caches
 
-
 // -------------------------
 // Routes
 // -------------------------
@@ -410,7 +535,6 @@ app.get('/', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Booking API running', timestamp: new Date().toISOString() });
 });
-
 
 // Main endpoint the frontend will call: returns normalized services from SimplyBook
 app.get('/api/services', async (req, res) => {
@@ -432,17 +556,148 @@ app.get('/api/services', async (req, res) => {
   }
 });
 
-/**
- * POST /api/get-slots, /api/create-booking, /api/create-payment
- * Keep your existing (unchanged) implementations — simplified for brevity here
- */
+// Create Mollie payment and attach a pending SimplyBook booking request.
+// Frontend should call this instead of calling create-payment + create-booking separately.
+app.post('/api/initiate-booking-payment', async (req, res) => {
+  try {
+    const { amount, description, redirectUrl, webhookUrl, bookingRequest } = req.body || {};
+    if (!amount || !description || !redirectUrl) {
+      return res.status(400).json({ success: false, error: 'amount, description and redirectUrl are required' });
+    }
+    if (!bookingRequest) {
+      return res.status(400).json({ success: false, error: 'bookingRequest is required' });
+    }
+    if (!process.env.MOLLIE_API_KEY) return res.status(500).json({ success: false, error: 'Mollie API key not configured' });
+
+    const payment = await mollieClient.payments.create({
+      amount: { value: Number(amount).toFixed(2), currency: 'EUR' },
+      description,
+      redirectUrl,
+      webhookUrl: webhookUrl || process.env.MOLLIE_WEBHOOK_URL || undefined,
+      metadata: {
+        purpose: 'simplybook_booking',
+        createdAt: new Date().toISOString()
+      }
+    });
+
+    pendingBookingsByPaymentId.set(payment.id, bookingRequest);
+    return res.json({ success: true, checkoutUrl: payment._links.checkout.href, paymentId: payment.id });
+  } catch (err) {
+    console.error('initiate-booking-payment error:', err);
+    return res.status(500).json({ success: false, error: 'Failed to create Mollie payment' });
+  }
+});
+
+// Mollie webhook: Mollie will POST { id: "tr_..." }
+app.post('/api/mollie-webhook', async (req, res) => {
+  try {
+    const paymentId = req.body?.id;
+    if (!paymentId) return res.status(400).send('Missing payment id');
+    if (processedPayments.has(paymentId)) return res.status(200).send('Already processed');
+
+    const payment = await mollieClient.payments.get(paymentId);
+    if (!payment) return res.status(404).send('Payment not found');
+
+    if (payment.status !== 'paid') {
+      return res.status(200).send(`Ignored status ${payment.status}`);
+    }
+
+    const bookingRequest = pendingBookingsByPaymentId.get(paymentId);
+    if (!bookingRequest) {
+      return res.status(200).send('No pending booking attached');
+    }
+
+    await createSimplyBookBooking(bookingRequest);
+    processedPayments.add(paymentId);
+
+    return res.status(200).send('OK');
+  } catch (err) {
+    console.error('mollie-webhook error:', err);
+    return res.status(500).send('Webhook error');
+  }
+});
+
+// Frontend can call this after redirect to ensure booking is created.
+app.post('/api/finalize-booking-after-payment', async (req, res) => {
+  try {
+    const { paymentId } = req.body || {};
+    if (!paymentId) return res.status(400).json({ success: false, error: 'paymentId is required' });
+    if (processedPayments.has(paymentId)) {
+      return res.json({ success: true, already_processed: true });
+    }
+
+    const payment = await mollieClient.payments.get(paymentId);
+    if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
+    if (payment.status !== 'paid') {
+      return res.status(400).json({ success: false, error: `Payment not paid (status=${payment.status})` });
+    }
+
+    const bookingRequest = pendingBookingsByPaymentId.get(paymentId);
+    if (!bookingRequest) {
+      return res.status(400).json({ success: false, error: 'No pending booking attached to paymentId' });
+    }
+
+    const bookingResult = await createSimplyBookBooking(bookingRequest);
+    processedPayments.add(paymentId);
+
+    return res.json({
+      success: true,
+      payment_status: payment.status,
+      booking: bookingResult.bookingResp,
+      confirmations: bookingResult.confirmations,
+      booking_details: bookingResult.booking_details
+    });
+  } catch (err) {
+    console.error('finalize-booking-after-payment error:', err);
+    return res.status(500).json({ success: false, error: 'Failed to finalize booking' });
+  }
+});
+
+// Service details (incl. duration)
+app.get('/api/services/:serviceId', async (req, res) => {
+  try {
+    const serviceId = req.params.serviceId;
+    if (!serviceId) return res.status(400).json({ ok: false, error: 'serviceId is required' });
+    const services = await fetchServicesCached(false);
+    const svc = services.find(s => String(s.id) === String(serviceId));
+    if (!svc) return res.status(404).json({ ok: false, error: 'Service not found' });
+    return res.json({ ok: true, data: svc });
+  } catch (err) {
+    console.error('/api/services/:serviceId error:', err.message || err);
+    return res.status(500).json({ ok: false, error: 'Failed to fetch service' });
+  }
+});
+
+// Available dates for a month (uses SimplyBook getWorkCalendar)
+app.post('/api/available-dates', async (req, res) => {
+  try {
+    const { year, month, performerId } = req.body || {};
+    if (!year || !month) return res.status(400).json({ success: false, error: 'Year and month are required' });
+
+    const token = await getSimplyBookTokenCached();
+    const response = await callAdminRpc(token, 'getWorkCalendar', [year, month, performerId || null]);
+    const calendar = response.result || {};
+    const available_dates = Object.keys(calendar).filter(date => calendar[date]?.is_day_off !== 1);
+
+    return res.json({
+      success: true,
+      year,
+      month,
+      performer_id: performerId || null,
+      available_dates
+    });
+  } catch (error) {
+    console.error('available-dates error:', error.response?.data || error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch available dates' });
+  }
+});
 
 // Get performers/units list (using official getUnitList method)
 app.get('/api/performers', async (req, res) => {
   try {
     const token = await getSimplyBookTokenCached();
     const response = await callAdminRpc(token, 'getUnitList', []);
-    
+
     const performers = Array.isArray(response.result) ? response.result : Object.values(response.result || {});
     const normalizedPerformers = performers.map(p => ({
       id: p.id || p.unit_id,
@@ -478,9 +733,9 @@ app.post('/api/work-calendar', async (req, res) => {
 
     const token = await getSimplyBookTokenCached();
     const response = await callAdminRpc(token, 'getWorkCalendar', [year, month, performerId || null]);
-    
+
     const calendar = response.result || {};
-    
+
     return res.json({
       success: true,
       year,
@@ -500,12 +755,12 @@ app.post('/api/work-calendar', async (req, res) => {
 app.post('/api/first-working-day', async (req, res) => {
   try {
     const { performerId } = req.body;
-    
+
     const token = await getSimplyBookTokenCached();
     const response = await callAdminRpc(token, 'getFirstWorkingDay', [performerId || null]);
-    
+
     const firstWorkingDay = response.result;
-    
+
     return res.json({
       success: true,
       performer_id: performerId,
@@ -513,10 +768,10 @@ app.post('/api/first-working-day', async (req, res) => {
       date_info: firstWorkingDay ? {
         date: firstWorkingDay,
         day_name: new Date(firstWorkingDay + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }),
-        formatted: new Date(firstWorkingDay + 'T00:00:00').toLocaleDateString('en-US', { 
-          year: 'numeric', 
-          month: 'long', 
-          day: 'numeric' 
+        formatted: new Date(firstWorkingDay + 'T00:00:00').toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
         })
       } : null
     });
@@ -534,7 +789,7 @@ app.get('/api/plugin-status/:pluginName', async (req, res) => {
 
     const token = await getSimplyBookTokenCached();
     const response = await callAdminRpc(token, 'isPluginActivated', [pluginName]);
-    
+
     return res.json({
       success: true,
       plugin_name: pluginName,
@@ -554,10 +809,10 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
     if (!serviceId) return res.status(400).json({ success: false, error: 'Service ID is required' });
 
     const token = await getSimplyBookTokenCached();
-    
+
     // First check if additional fields plugin is activated
     const pluginStatus = await callAdminRpc(token, 'isPluginActivated', ['event_field']);
-    
+
     if (!pluginStatus.result) {
       return res.json({
         success: true,
@@ -569,7 +824,7 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
 
     // Get additional fields for the service
     const response = await callAdminRpc(token, 'getEventFields', [parseInt(serviceId, 10)]);
-    
+
     const fields = Array.isArray(response.result) ? response.result : [];
     const normalizedFields = fields.map(field => ({
       id: field.id,
@@ -621,7 +876,7 @@ app.post('/api/get-slots', async (req, res) => {
     const matrix = response.result || {};
     const times = matrix[formattedDate] || [];
     const weekday = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
-    
+
     // Enhanced slot information with timezone support
     const slots = times.map(t => ({
       time: t,
@@ -632,9 +887,9 @@ app.post('/api/get-slots', async (req, res) => {
       date: formattedDate,
       formatted_time: `${t} ${timezone || 'UTC'}`
     }));
-    
-    return res.json({ 
-      success: true, 
+
+    return res.json({
+      success: true,
       slots,
       metadata: {
         date: formattedDate,
@@ -653,117 +908,13 @@ app.post('/api/get-slots', async (req, res) => {
 // Create Booking (using official book method)
 app.post('/api/create-booking', async (req, res) => {
   try {
-    const { serviceId, performerId, datetime, clientData, additionalFields } = req.body;
-    if (!serviceId || !datetime || !clientData) {
-      return res.status(400).json({ success: false, error: 'Missing required booking data' });
-    }
-
-    const token = await getSimplyBookTokenCached();
-    const adminBase = `${SIMPLYBOOK_CONFIG.apiUrl}/admin`;
-
-    // try to find existing client
-    let clientId;
-    try {
-      const existingClientResp = await axios.get(`${adminBase}/clients`, {
-        headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token },
-        params: { email: clientData.email },
-        timeout: 15000
-      });
-      const clientsRaw = Array.isArray(existingClientResp.data) ? existingClientResp.data : (existingClientResp.data.result || existingClientResp.data.clients || []);
-      if (Array.isArray(clientsRaw) && clientsRaw.length > 0) clientId = clientsRaw[0].id;
-    } catch (e) {
-      // Client lookup failed, will create new
-    }
-
-    if (!clientId) {
-      const clientResp = await axios.post(`${adminBase}/clients`, {
-        name: clientData.full_name,
-        email: clientData.email,
-        phone: clientData.phone
-      }, {
-        headers: { 'X-Company-Login': SIMPLYBOOK_CONFIG.company, 'X-Token': token, 'Content-Type': 'application/json' },
-        timeout: 15000
-      });
-      const clientDataResp = clientResp.data && clientResp.data.id ? clientResp.data : (clientResp.data.result || clientResp.data.client || clientResp.data);
-      clientId = clientDataResp.id;
-    }
-
-    // Parse datetime to get date and time components
-    const datetimeObj = new Date(datetime);
-    const startDate = datetimeObj.toISOString().split('T')[0];
-    const startTime = datetimeObj.toTimeString().split(' ')[0].substring(0, 5);
-
-    // Use official book method with proper parameters
-    const bookingPayload = {
-      service_id: parseInt(serviceId, 10),
-      unit_id: performerId ? parseInt(performerId, 10) : null,
-      start_date: startDate,
-      start_time: startTime,
-      client_data: {
-        name: clientData.full_name,
-        email: clientData.email,
-        phone: clientData.phone
-      },
-      additional_fields: additionalFields || {
-        city: clientData.city || '',
-        country: clientData.country || '',
-        wellness_priority: clientData.wellness_priority || '',
-        consultation_type: clientData.consultation_type || 'in-person',
-        translator: clientData.translator || 'no',
-        hear_about: clientData.hear_about || '',
-        consultation_package: clientData.consultation_package || '',
-        location_name: clientData.location_name || '',
-        location_address: clientData.location_address || '',
-        online_meeting: clientData.online_meeting || false,
-        meeting_url: clientData.meeting_url || '',
-        preferred_time_slot: startTime,
-        booking_timezone: clientData.timezone || 'UTC'
-      },
-      count: 1
-    };
-
-    let bookingResp;
-    try {
-      // Use official book method
-      bookingResp = await callAdminRpc(token, 'book', [
-        bookingPayload.service_id,
-        bookingPayload.unit_id,
-        bookingPayload.start_date,
-        bookingPayload.start_time,
-        bookingPayload.client_data,
-        bookingPayload.additional_fields,
-        bookingPayload.count
-      ]);
-    } catch (e1) {
-      // Fallback to other booking methods
-      try {
-        const fallbackPayload = {
-          service_id: bookingPayload.service_id,
-          client_id: parseInt(clientId, 10),
-          start_datetime: datetime,
-          end_datetime: new Date(new Date(datetime).getTime() + 60 * 60 * 1000).toISOString(),
-          additional_fields: bookingPayload.additional_fields
-        };
-        bookingResp = await callAdminRpc(token, 'bookSession', [fallbackPayload]);
-      } catch (e2) {
-        throw e2;
-      }
-    }
-
-    return res.json({ 
-      success: true, 
-      booking: bookingResp,
+    const result = await createSimplyBookBooking(req.body);
+    return res.json({
+      success: true,
+      booking: result.bookingResp,
+      confirmations: result.confirmations,
       message: 'Booking created successfully',
-      booking_details: {
-        service_id: serviceId,
-        performer_id: performerId,
-        start_date: startDate,
-        start_time: startTime,
-        client_info: {
-          name: clientData.full_name,
-          email: clientData.email
-        }
-      }
+      booking_details: result.booking_details
     });
   } catch (error) {
     console.error('create-booking error:', error.response?.data || error.message);
@@ -774,7 +925,7 @@ app.post('/api/create-booking', async (req, res) => {
 // Mollie payment (unchanged)
 app.post('/api/create-payment', async (req, res) => {
   try {
-    const { amount, description, redirectUrl, metadata } = req.body;
+    const { amount, description, redirectUrl, metadata, webhookUrl } = req.body;
     if (!amount || !description || !redirectUrl) return res.status(400).json({ success: false, error: 'amount, description and redirectUrl are required' });
     if (!process.env.MOLLIE_API_KEY) return res.status(500).json({ success: false, error: 'Mollie API key not configured' });
 
@@ -782,6 +933,7 @@ app.post('/api/create-payment', async (req, res) => {
       amount: { value: Number(amount).toFixed(2), currency: 'EUR' },
       description,
       redirectUrl,
+      webhookUrl: webhookUrl || process.env.MOLLIE_WEBHOOK_URL || undefined,
       metadata: metadata || {}
     });
 
