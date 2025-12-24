@@ -329,9 +329,26 @@ async function createSimplyBookBooking({ serviceId, performerId, datetime, clien
     startTime = iso.split('T')[1].substring(0, 5);
   }
 
+  const startDateTime = `${startDate} ${startTime}:00`;
+
+  let resolvedPerformerId = performerId ? parseInt(performerId, 10) : null;
+  if (!resolvedPerformerId) {
+    try {
+      const availableUnitsResp = await callAdminRpc(token, 'getAvailableUnits', [parseInt(serviceId, 10), startDateTime, 1]);
+      const unitsRaw = availableUnitsResp?.result;
+      const units = Array.isArray(unitsRaw) ? unitsRaw : Object.values(unitsRaw || {});
+      if (units.length > 0) {
+        const first = units[0];
+        resolvedPerformerId = parseInt(first?.id || first?.unit_id || first, 10);
+      }
+    } catch (e) {
+      // ignore and proceed with null performer id
+    }
+  }
+
   const bookingPayload = {
     service_id: parseInt(serviceId, 10),
-    unit_id: performerId ? parseInt(performerId, 10) : null,
+    unit_id: Number.isFinite(resolvedPerformerId) ? resolvedPerformerId : null,
     start_date: startDate,
     start_time: startTime,
     client_data: {
@@ -389,7 +406,7 @@ async function createSimplyBookBooking({ serviceId, performerId, datetime, clien
     confirmations,
     booking_details: {
       service_id: serviceId,
-      performer_id: performerId,
+      performer_id: Number.isFinite(resolvedPerformerId) ? resolvedPerformerId : performerId,
       start_date: startDate,
       start_time: startTime,
       client_info: {
@@ -570,6 +587,52 @@ app.get('/api/services', async (req, res) => {
       ok: false,
       error: err.message || 'Failed to fetch services from SimplyBook'
     });
+  }
+});
+
+app.post('/api/available-units', async (req, res) => {
+  try {
+    const { serviceId, startDateTime, datetime, count } = req.body || {};
+    if (!serviceId) return res.status(400).json({ success: false, error: 'serviceId is required' });
+
+    let start = startDateTime;
+    if (!start && typeof datetime === 'string') {
+      const m = datetime.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})/);
+      if (m) start = `${m[1]} ${m[2]}:00`;
+    }
+    if (!start) return res.status(400).json({ success: false, error: 'startDateTime or datetime is required' });
+
+    const token = await getSimplyBookTokenCached();
+    const qty = Number.isFinite(Number(count)) ? parseInt(count, 10) : 1;
+    const response = await callAdminRpc(token, 'getAvailableUnits', [parseInt(serviceId, 10), start, qty]);
+    const unitsRaw = response?.result;
+    const units = Array.isArray(unitsRaw) ? unitsRaw : Object.values(unitsRaw || {});
+
+    return res.json({ success: true, count: units.length, units });
+  } catch (error) {
+    console.error('available-units error:', error.response?.data || error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch available units' });
+  }
+});
+
+app.post('/api/calculate-end-time', async (req, res) => {
+  try {
+    const { startDateTime, datetime, serviceId, performerId } = req.body || {};
+    if (!serviceId) return res.status(400).json({ success: false, error: 'serviceId is required' });
+
+    let start = startDateTime;
+    if (!start && typeof datetime === 'string') {
+      const m = datetime.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})/);
+      if (m) start = `${m[1]} ${m[2]}:00`;
+    }
+    if (!start) return res.status(400).json({ success: false, error: 'startDateTime or datetime is required' });
+
+    const token = await getSimplyBookTokenCached();
+    const response = await callAdminRpc(token, 'calculateEndTime', [start, parseInt(serviceId, 10), performerId ? parseInt(performerId, 10) : null]);
+    return res.json({ success: true, endDateTime: response?.result, raw: response });
+  } catch (error) {
+    console.error('calculate-end-time error:', error.response?.data || error.message);
+    return res.status(500).json({ success: false, error: 'Failed to calculate end time' });
   }
 });
 
