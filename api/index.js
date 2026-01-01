@@ -582,8 +582,9 @@ app.get('/', (req, res) => {
       // Availability endpoints
       service_availability: 'POST /api/service-availability - Get available dates with time slots for a service',
       service_available_dates: 'POST /api/service-available-dates - Get available dates for a service',
-      get_slots: 'POST /api/get-slots - Get available time slots for a specific date',
+      get_slots: 'POST /api/get-slots - Get available time slots for a specific date (handles events/courses)',
       available_dates: 'POST /api/available-dates - Get available dates for a month (work calendar)',
+      service_debug: 'GET /api/service-debug/:serviceId - Debug service availability methods',
       // Booking endpoints
       create_booking: 'POST /api/create-booking - Create a booking in SimplyBook',
       // Other endpoints
@@ -834,43 +835,112 @@ app.post('/api/service-available-dates', async (req, res) => {
     const performerIdInt = performerId ? parseInt(performerId, 10) : null;
     const countInt = count ? parseInt(count, 10) : 1;
 
-    // Use getStartTimeMatrix to get available slots across date range
-    const response = await callAdminRpc(token, 'getStartTimeMatrix', [
-      dateFrom,
-      dateTo,
-      serviceIdInt,
-      performerIdInt,
-      countInt
-    ]);
-
-    const matrix = response.result || {};
     const available_dates = [];
+    const dateMap = new Map(); // Track dates and their slots
 
-    // Extract dates that have available time slots
-    Object.keys(matrix).forEach(date => {
-      const times = matrix[date];
-      if (Array.isArray(times) && times.length > 0) {
-        // Filter out empty or invalid times
-        const validTimes = times.filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)));
-        if (validTimes.length > 0) {
+    // For events/courses, first try getEventListPublic to get specific occurrences
+    try {
+      const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
+      
+      if (eventListResp && eventListResp.result && Array.isArray(eventListResp.result)) {
+        // Filter events matching our service ID
+        const matchingEvents = eventListResp.result.filter(event => {
+          const eventId = event.id || event.event_id || event.service_id;
+          return parseInt(eventId, 10) === serviceIdInt;
+        });
+
+        // Process each matching event occurrence
+        matchingEvents.forEach(event => {
+          let eventDate = event.date || event.start_date || event.occurrence_date;
+          let eventTime = event.start_time || event.time;
+          
+          // Extract date from start_datetime if date not directly available
+          if (!eventDate && (event.start_datetime || event.datetime)) {
+            const dtStr = event.start_datetime || event.datetime;
+            eventDate = typeof dtStr === 'string' ? dtStr.split('T')[0] : new Date(dtStr).toISOString().split('T')[0];
+          }
+          
+          // Extract time from start_datetime if time not directly available
+          if (!eventTime && (event.start_datetime || event.datetime)) {
+            const dtStr = event.start_datetime || event.datetime;
+            if (typeof dtStr === 'string') {
+              const timeMatch = dtStr.match(/(\d{2}:\d{2})/);
+              eventTime = timeMatch ? timeMatch[1] : null;
+            }
+          }
+
+          if (eventDate && eventTime) {
+            const dateStr = typeof eventDate === 'string' ? eventDate.split('T')[0] : new Date(eventDate).toISOString().split('T')[0];
+            const timeStr = typeof eventTime === 'string' ? eventTime.substring(0, 5) : String(eventTime).substring(0, 5);
+
+            if (!dateMap.has(dateStr)) {
+              dateMap.set(dateStr, []);
+            }
+            
+            if (!dateMap.get(dateStr).includes(timeStr)) {
+              dateMap.get(dateStr).push(timeStr);
+            }
+          }
+        });
+
+        // Convert map to available_dates array
+        dateMap.forEach((times, date) => {
           available_dates.push({
             date: date,
-            available_slots: validTimes.length,
-            times: validTimes.map(t => typeof t === 'string' ? t : (t.time || t.start_time))
+            available_slots: times.length,
+            times: times.sort(),
+            source: 'event_occurrence'
           });
-        }
-      } else if (typeof times === 'object' && times !== null) {
-        // Handle object format
-        const timesArray = Object.values(times).flat();
-        if (timesArray.length > 0) {
-          available_dates.push({
-            date: date,
-            available_slots: timesArray.length,
-            times: timesArray.map(t => typeof t === 'string' ? t : (t.time || t.start_time))
-          });
-        }
+        });
       }
-    });
+    } catch (eventError) {
+      console.log('getEventListPublic failed, trying getStartTimeMatrix:', eventError.message);
+    }
+
+    // If no dates from events or as fallback, use getStartTimeMatrix
+    if (available_dates.length === 0) {
+      try {
+        const response = await callAdminRpc(token, 'getStartTimeMatrix', [
+          dateFrom,
+          dateTo,
+          serviceIdInt,
+          performerIdInt,
+          countInt
+        ]);
+
+        const matrix = response.result || {};
+
+        // Extract dates that have available time slots
+        Object.keys(matrix).forEach(date => {
+          const times = matrix[date];
+          if (Array.isArray(times) && times.length > 0) {
+            // Filter out empty or invalid times
+            const validTimes = times.filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)));
+            if (validTimes.length > 0) {
+              available_dates.push({
+                date: date,
+                available_slots: validTimes.length,
+                times: validTimes.map(t => typeof t === 'string' ? t : (t.time || t.start_time)),
+                source: 'time_matrix'
+              });
+            }
+          } else if (typeof times === 'object' && times !== null) {
+            // Handle object format
+            const timesArray = Object.values(times).flat();
+            if (timesArray.length > 0) {
+              available_dates.push({
+                date: date,
+                available_slots: timesArray.length,
+                times: timesArray.map(t => typeof t === 'string' ? t : (t.time || t.start_time)),
+                source: 'time_matrix'
+              });
+            }
+          }
+        });
+      } catch (matrixError) {
+        console.error('getStartTimeMatrix also failed:', matrixError.message);
+      }
+    }
 
     // Sort dates chronologically
     available_dates.sort((a, b) => a.date.localeCompare(b.date));
@@ -1051,7 +1121,8 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
   }
 });
 
-// Get Available Time Slots for a specific date and service (using official getStartTimeMatrix method)
+// Get Available Time Slots for a specific date and service
+// Handles both regular services and events/courses with fixed dates
 app.post('/api/get-slots', async (req, res) => {
   try {
     const { serviceId, date, performerId, timezone, count } = req.body;
@@ -1081,48 +1152,136 @@ app.post('/api/get-slots', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid date format' });
     }
 
-    // Use official getStartTimeMatrix method: getStartTimeMatrix(dateFrom, dateTo, eventId, unitId, count)
     const serviceIdInt = parseInt(serviceId, 10);
     const performerIdInt = performerId ? parseInt(performerId, 10) : null;
     const countInt = count ? parseInt(count, 10) : 1;
 
-    const response = await callAdminRpc(token, 'getStartTimeMatrix', [
-      formattedDate,  // dateFrom
-      formattedDate,  // dateTo (same day for single date query)
-      serviceIdInt,   // eventId (service ID)
-      performerIdInt, // unitId (performer/provider ID, null for any)
-      countInt        // count (number of bookings)
-    ]);
-
-    const matrix = response.result || {};
-    const times = matrix[formattedDate] || [];
-    
-    // Handle case where matrix might be an array or object
     let availableTimes = [];
-    if (Array.isArray(times)) {
-      availableTimes = times;
-    } else if (typeof times === 'object' && times !== null) {
-      // If it's an object, try to extract times
-      availableTimes = Object.values(times).flat();
-    }
-
+    let slots = [];
     const weekday = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
     const timezoneStr = timezone || 'UTC';
 
-    // Enhanced slot information with timezone support
-    const slots = availableTimes.map(t => {
-      const timeStr = typeof t === 'string' ? t : (t.time || t.start_time || '');
-      return {
-        time: timeStr,
-        available: true,
-        id: `${formattedDate}_${timeStr.replace(':', '')}`,
-        timezone: timezoneStr,
-        weekday: weekday,
-        date: formattedDate,
-        datetime: `${formattedDate}T${timeStr}:00`,
-        formatted_time: `${timeStr} ${timezoneStr}`
-      };
-    }).filter(slot => slot.time); // Filter out empty times
+    // For events/courses with fixed dates, try getEventListPublic first
+    // This method returns specific event occurrences/instances
+    try {
+      const eventListResp = await callPublicRpc('getEventListPublic', [formattedDate, formattedDate]);
+      
+      if (eventListResp && eventListResp.result && Array.isArray(eventListResp.result)) {
+        // Filter events matching our service ID and date
+        const matchingEvents = eventListResp.result.filter(event => {
+          const eventId = event.id || event.event_id || event.service_id;
+          const eventDate = event.date || event.start_date || event.occurrence_date;
+          
+          // Check if event ID matches and date matches
+          if (parseInt(eventId, 10) === serviceIdInt) {
+            if (eventDate) {
+              const eventDateStr = typeof eventDate === 'string' 
+                ? eventDate.split('T')[0] 
+                : new Date(eventDate).toISOString().split('T')[0];
+              if (eventDateStr === formattedDate) {
+                return true;
+              }
+            } else {
+              // If no date field, check start_datetime
+              const startDt = event.start_datetime || event.start_time || event.datetime;
+              if (startDt) {
+                const startDateStr = typeof startDt === 'string' 
+                  ? startDt.split('T')[0] 
+                  : new Date(startDt).toISOString().split('T')[0];
+                if (startDateStr === formattedDate) {
+                  return true;
+                }
+              }
+            }
+          }
+          return false;
+        });
+
+        if (matchingEvents.length > 0) {
+          // Extract times from event occurrences
+          matchingEvents.forEach(event => {
+            const startTime = event.start_time || event.time || event.start_datetime;
+            if (startTime) {
+              let timeStr = '';
+              if (typeof startTime === 'string') {
+                // Extract time from datetime string (HH:MM format)
+                const timeMatch = startTime.match(/(\d{2}:\d{2})/);
+                timeStr = timeMatch ? timeMatch[1] : startTime.substring(0, 5);
+              } else {
+                timeStr = String(startTime).substring(0, 5);
+              }
+              
+              if (timeStr && !availableTimes.includes(timeStr)) {
+                availableTimes.push(timeStr);
+              }
+            }
+          });
+
+          // If we found event occurrences, use those times
+          if (availableTimes.length > 0) {
+            slots = availableTimes.map(timeStr => ({
+              time: timeStr,
+              available: true,
+              id: `${formattedDate}_${timeStr.replace(':', '')}`,
+              timezone: timezoneStr,
+              weekday: weekday,
+              date: formattedDate,
+              datetime: `${formattedDate}T${timeStr}:00`,
+              formatted_time: `${timeStr} ${timezoneStr}`,
+              source: 'event_occurrence'
+            })).sort((a, b) => a.time.localeCompare(b.time));
+          }
+        }
+      }
+    } catch (eventError) {
+      console.log('getEventListPublic failed or returned no matches, trying getStartTimeMatrix:', eventError.message);
+    }
+
+    // If no slots found from events, try standard getStartTimeMatrix method
+    if (slots.length === 0) {
+      try {
+        const response = await callAdminRpc(token, 'getStartTimeMatrix', [
+          formattedDate,  // dateFrom
+          formattedDate,  // dateTo (same day for single date query)
+          serviceIdInt,   // eventId (service ID)
+          performerIdInt, // unitId (performer/provider ID, null for any)
+          countInt        // count (number of bookings)
+        ]);
+
+        const matrix = response.result || {};
+        const times = matrix[formattedDate] || [];
+        
+        // Handle case where matrix might be an array or object
+        let timesArray = [];
+        if (Array.isArray(times)) {
+          timesArray = times;
+        } else if (typeof times === 'object' && times !== null) {
+          // If it's an object, try to extract times
+          timesArray = Object.values(times).flat();
+        }
+
+        slots = timesArray
+          .map(t => {
+            const timeStr = typeof t === 'string' ? t : (t.time || t.start_time || '');
+            return timeStr ? {
+              time: timeStr,
+              available: true,
+              id: `${formattedDate}_${timeStr.replace(':', '')}`,
+              timezone: timezoneStr,
+              weekday: weekday,
+              date: formattedDate,
+              datetime: `${formattedDate}T${timeStr}:00`,
+              formatted_time: `${timeStr} ${timezoneStr}`,
+              source: 'time_matrix'
+            } : null;
+          })
+          .filter(slot => slot !== null)
+          .sort((a, b) => a.time.localeCompare(b.time));
+      } catch (matrixError) {
+        console.error('getStartTimeMatrix also failed:', matrixError.message);
+        throw new Error(`Both event and matrix methods failed: ${matrixError.message}`);
+      }
+    }
 
     return res.json({
       success: true,
@@ -1133,13 +1292,122 @@ app.post('/api/get-slots', async (req, res) => {
         service_id: serviceId,
         performer_id: performerId,
         total_slots: slots.length,
-        count: countInt
+        count: countInt,
+        source: slots.length > 0 ? slots[0].source : 'none'
       }
     });
   } catch (error) {
     console.error('get-slots error:', error.response?.data || error.message);
     const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch time slots';
     return res.status(500).json({ success: false, error: errorMsg });
+  }
+});
+
+// Debug endpoint: Get service details and test different availability methods
+app.get('/api/service-debug/:serviceId', async (req, res) => {
+  try {
+    const { serviceId } = req.params;
+    const { dateFrom, dateTo } = req.query;
+    
+    if (!serviceId) {
+      return res.status(400).json({ success: false, error: 'Service ID is required' });
+    }
+
+    const token = await getSimplyBookTokenCached();
+    const serviceIdInt = parseInt(serviceId, 10);
+    
+    // Get service details
+    const services = await fetchServicesCached(false);
+    const service = services.find(s => String(s.id) === String(serviceId));
+    
+    // Set date range (default to next 30 days)
+    let startDate = dateFrom || new Date().toISOString().split('T')[0];
+    let endDate = dateTo || new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString().split('T')[0];
+
+    const debug = {
+      service_id: serviceId,
+      service_details: service || null,
+      date_range: { from: startDate, to: endDate }
+    };
+
+    // Test getEventListPublic (for events/courses)
+    try {
+      const eventListResp = await callPublicRpc('getEventListPublic', [startDate, endDate]);
+      debug.getEventListPublic = {
+        success: true,
+        total_events: eventListResp?.result?.length || 0,
+        matching_events: eventListResp?.result?.filter(e => {
+          const id = e.id || e.event_id || e.service_id;
+          return parseInt(id, 10) === serviceIdInt;
+        }) || [],
+        all_events_sample: eventListResp?.result?.slice(0, 3) || []
+      };
+    } catch (e) {
+      debug.getEventListPublic = {
+        success: false,
+        error: e.message
+      };
+    }
+
+    // Test getStartTimeMatrix (for regular services)
+    try {
+      const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
+        startDate,
+        endDate,
+        serviceIdInt,
+        null,
+        1
+      ]);
+      debug.getStartTimeMatrix = {
+        success: true,
+        result: matrixResp.result || {},
+        dates_with_slots: Object.keys(matrixResp.result || {}).length
+      };
+    } catch (e) {
+      debug.getStartTimeMatrix = {
+        success: false,
+        error: e.message,
+        details: e.response?.data || null
+      };
+    }
+
+    // Test getEventList (admin) for service details
+    try {
+      const eventListAdminResp = await callAdminRpc(token, 'getEventList', []);
+      const eventListAdmin = Array.isArray(eventListAdminResp.result)
+        ? eventListAdminResp.result
+        : Object.values(eventListAdminResp.result || {});
+      const matchingEvent = eventListAdmin.find(e => {
+        const id = e.id || e.event_id || e.service_id;
+        return parseInt(id, 10) === serviceIdInt;
+      });
+      debug.getEventList_admin = {
+        success: true,
+        found: !!matchingEvent,
+        event_details: matchingEvent || null
+      };
+    } catch (e) {
+      debug.getEventList_admin = {
+        success: false,
+        error: e.message
+      };
+    }
+
+    return res.json({
+      success: true,
+      debug: debug,
+      recommendation: debug.getEventListPublic?.matching_events?.length > 0
+        ? 'This appears to be an event/course type service. Use getEventListPublic method.'
+        : debug.getStartTimeMatrix?.dates_with_slots > 0
+        ? 'This appears to be a regular service. Use getStartTimeMatrix method.'
+        : 'Service may not have availability in the requested date range or may need different configuration.'
+    });
+  } catch (error) {
+    console.error('service-debug error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
@@ -1178,48 +1446,123 @@ app.post('/api/service-availability', async (req, res) => {
     const performerIdInt = performerId ? parseInt(performerId, 10) : null;
     const countInt = count ? parseInt(count, 10) : 1;
 
-    // Get time matrix for the entire date range
-    const response = await callAdminRpc(token, 'getStartTimeMatrix', [
-      dateFrom,
-      dateTo,
-      serviceIdInt,
-      performerIdInt,
-      countInt
-    ]);
-
-    const matrix = response.result || {};
     const availability = [];
+    const dateMap = new Map(); // Track dates and their slots
 
-    // Process each date that has available slots
-    Object.keys(matrix).forEach(date => {
-      const times = matrix[date];
-      let availableTimes = [];
+    // For events/courses, first try getEventListPublic to get specific occurrences
+    try {
+      const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
       
-      if (Array.isArray(times) && times.length > 0) {
-        availableTimes = times.filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)))
-          .map(t => typeof t === 'string' ? t : (t.time || t.start_time));
-      } else if (typeof times === 'object' && times !== null) {
-        const timesArray = Object.values(times).flat();
-        availableTimes = timesArray
-          .filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)))
-          .map(t => typeof t === 'string' ? t : (t.time || t.start_time));
-      }
+      if (eventListResp && eventListResp.result && Array.isArray(eventListResp.result)) {
+        // Filter events matching our service ID
+        const matchingEvents = eventListResp.result.filter(event => {
+          const eventId = event.id || event.event_id || event.service_id;
+          return parseInt(eventId, 10) === serviceIdInt;
+        });
 
-      if (availableTimes.length > 0) {
-        const dateObj = new Date(date + 'T00:00:00');
-        availability.push({
-          date: date,
-          weekday: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
-          available_slots: availableTimes.length,
-          times: availableTimes.sort(),
-          slots: availableTimes.map(time => ({
-            time: time,
-            datetime: `${date}T${time}:00`,
-            formatted: `${date} ${time}`
-          }))
+        // Process each matching event occurrence
+        matchingEvents.forEach(event => {
+          let eventDate = event.date || event.start_date || event.occurrence_date;
+          let eventTime = event.start_time || event.time;
+          
+          // Extract date from start_datetime if date not directly available
+          if (!eventDate && (event.start_datetime || event.datetime)) {
+            const dtStr = event.start_datetime || event.datetime;
+            eventDate = typeof dtStr === 'string' ? dtStr.split('T')[0] : new Date(dtStr).toISOString().split('T')[0];
+          }
+          
+          // Extract time from start_datetime if time not directly available
+          if (!eventTime && (event.start_datetime || event.datetime)) {
+            const dtStr = event.start_datetime || event.datetime;
+            if (typeof dtStr === 'string') {
+              const timeMatch = dtStr.match(/(\d{2}:\d{2})/);
+              eventTime = timeMatch ? timeMatch[1] : null;
+            }
+          }
+
+          if (eventDate && eventTime) {
+            const dateStr = typeof eventDate === 'string' ? eventDate.split('T')[0] : new Date(eventDate).toISOString().split('T')[0];
+            const timeStr = typeof eventTime === 'string' ? eventTime.substring(0, 5) : String(eventTime).substring(0, 5);
+
+            if (!dateMap.has(dateStr)) {
+              dateMap.set(dateStr, []);
+            }
+            
+            if (!dateMap.get(dateStr).includes(timeStr)) {
+              dateMap.get(dateStr).push(timeStr);
+            }
+          }
+        });
+
+        // Convert map to availability array
+        dateMap.forEach((times, date) => {
+          const dateObj = new Date(date + 'T00:00:00');
+          availability.push({
+            date: date,
+            weekday: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
+            available_slots: times.length,
+            times: times.sort(),
+            slots: times.sort().map(time => ({
+              time: time,
+              datetime: `${date}T${time}:00`,
+              formatted: `${date} ${time}`
+            })),
+            source: 'event_occurrence'
+          });
         });
       }
-    });
+    } catch (eventError) {
+      console.log('getEventListPublic failed, trying getStartTimeMatrix:', eventError.message);
+    }
+
+    // If no availability from events or as fallback, use getStartTimeMatrix
+    if (availability.length === 0) {
+      try {
+        const response = await callAdminRpc(token, 'getStartTimeMatrix', [
+          dateFrom,
+          dateTo,
+          serviceIdInt,
+          performerIdInt,
+          countInt
+        ]);
+
+        const matrix = response.result || {};
+
+        // Process each date that has available slots
+        Object.keys(matrix).forEach(date => {
+          const times = matrix[date];
+          let availableTimes = [];
+          
+          if (Array.isArray(times) && times.length > 0) {
+            availableTimes = times.filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)))
+              .map(t => typeof t === 'string' ? t : (t.time || t.start_time));
+          } else if (typeof times === 'object' && times !== null) {
+            const timesArray = Object.values(times).flat();
+            availableTimes = timesArray
+              .filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)))
+              .map(t => typeof t === 'string' ? t : (t.time || t.start_time));
+          }
+
+          if (availableTimes.length > 0) {
+            const dateObj = new Date(date + 'T00:00:00');
+            availability.push({
+              date: date,
+              weekday: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
+              available_slots: availableTimes.length,
+              times: availableTimes.sort(),
+              slots: availableTimes.sort().map(time => ({
+                time: time,
+                datetime: `${date}T${time}:00`,
+                formatted: `${date} ${time}`
+              })),
+              source: 'time_matrix'
+            });
+          }
+        });
+      } catch (matrixError) {
+        console.error('getStartTimeMatrix also failed:', matrixError.message);
+      }
+    }
 
     // Sort dates chronologically
     availability.sort((a, b) => a.date.localeCompare(b.date));
