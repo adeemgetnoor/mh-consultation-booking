@@ -427,8 +427,8 @@ async function createSimplyBookBooking({ serviceId, performerId, datetime, clien
     ]);
 
     // Validate response
-    if (!bookingResp || (bookingResp.error && !bookingResp.result)) {
-      throw new Error(bookingResp?.error?.message || 'Booking failed - no result returned');
+    if (bookingResp?.error) {
+      throw new Error(bookingResp.error.message || 'Booking failed');
     }
   } catch (e1) {
     console.error('Primary book method failed, trying fallback:', e1.message);
@@ -520,7 +520,7 @@ async function getSlotsFromEvents(token, serviceId, dateFrom, dateTo) {
   const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
   
   if (!eventListResp || !eventListResp.result || !Array.isArray(eventListResp.result)) {
-    return [];
+    return new Map();
   }
 
   // Filter events matching service ID and date range
@@ -961,32 +961,10 @@ app.post('/api/service-available-dates', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Start date must be before end date' });
     }
 
-    // Get service details to check type
-    const services = await fetchServicesCached(false);
-    const service = services.find(s => String(s.id) === String(serviceId));
-    
-    if (!service) {
-      return res.status(404).json({ success: false, error: 'Service not found' });
-    }
-
-    const serviceType = service.type || 'service';
     const available_dates = [];
 
-    // Use appropriate method based on service type (not both!)
-    if (serviceType === 'event') {
-      // For events/courses: use getEventListPublic
-      const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
-      
-      // Convert map to available_dates array
-      timesMap.forEach((times, date) => {
-        available_dates.push({
-          date: date,
-          available_slots: times.length,
-          times: times.sort()
-        });
-      });
-    } else {
-      // For regular services: use getStartTimeMatrix
+    // ✅ ALWAYS try getStartTimeMatrix first
+    try {
       const response = await callAdminRpc(token, 'getStartTimeMatrix', [
         dateFrom,
         dateTo,
@@ -1020,6 +998,28 @@ app.post('/api/service-available-dates', async (req, res) => {
           }
         }
       });
+    } catch (matrixError) {
+      console.warn('getStartTimeMatrix failed, trying event fallback');
+    }
+
+    // 🔁 fallback for events (only if no dates from matrix)
+    if (available_dates.length === 0) {
+      try {
+        const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
+        
+        // Convert map to available_dates array
+        timesMap.forEach((times, date) => {
+          if (times.length > 0) {
+            available_dates.push({
+              date: date,
+              available_slots: times.length,
+              times: times.sort()
+            });
+          }
+        });
+      } catch (eventError) {
+        console.warn('Event fallback also failed');
+      }
     }
 
     // Sort dates chronologically
@@ -1205,87 +1205,69 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
 // Uses service.type to determine which API method: 'event' -> getEventListPublic, 'service' -> getStartTimeMatrix
 app.post('/api/get-slots', async (req, res) => {
   try {
-    const { serviceId, date, performerId, timezone, count } = req.body;
-    if (!serviceId || !date) return res.status(400).json({ success: false, error: 'Service ID and date are required' });
+    const { serviceId, date, performerId, count } = req.body;
+    if (!serviceId || !date) {
+      return res.status(400).json({ success: false, error: 'serviceId and date are required' });
+    }
 
     const token = await getSimplyBookTokenCached();
-    
-    // Parse and validate date
-    let dateObj;
-    let formattedDate;
-    if (typeof date === 'string') {
-      // Handle ISO date string or YYYY-MM-DD format
-      const dateMatch = date.match(/^(\d{4}-\d{2}-\d{2})/);
-      if (dateMatch) {
-        formattedDate = dateMatch[1];
-        dateObj = new Date(formattedDate + 'T00:00:00');
-      } else {
-        dateObj = new Date(date);
-        formattedDate = dateObj.toISOString().split('T')[0];
+
+    const formattedDate = date.substring(0, 10); // YYYY-MM-DD
+
+    // ✅ ALWAYS try service slots first
+    let times = [];
+    try {
+      times = await getSlotsFromTimeMatrix(
+        token,
+        serviceId,
+        formattedDate,
+        performerId,
+        count || 1
+      );
+    } catch (e) {
+      console.warn('getStartTimeMatrix failed, trying event fallback');
+    }
+
+    // 🔁 fallback for events (only if no slots)
+    if (!times || times.length === 0) {
+      try {
+        const timesMap = await getSlotsFromEvents(
+          token,
+          serviceId,
+          formattedDate,
+          formattedDate
+        );
+        times = timesMap.get(formattedDate) || [];
+      } catch (eventError) {
+        console.warn('Event fallback failed:', eventError.message);
+        times = [];
       }
-    } else {
-      dateObj = new Date(date);
-      formattedDate = dateObj.toISOString().split('T')[0];
-    }
-    
-    if (isNaN(dateObj.getTime())) {
-      return res.status(400).json({ success: false, error: 'Invalid date format' });
     }
 
-    // Get service details to check type
-    const services = await fetchServicesCached(false);
-    const service = services.find(s => String(s.id) === String(serviceId));
-    
-    if (!service) {
-      return res.status(404).json({ success: false, error: 'Service not found' });
-    }
-
-    const weekday = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
-    const timezoneStr = timezone || 'UTC';
-    const serviceType = service.type || 'service'; // Default to 'service' if type not set
-    let availableTimes = [];
-
-    // Use appropriate method based on service type (not both!)
-    if (serviceType === 'event') {
-      // For events/courses: use getEventListPublic
-      const timesMap = await getSlotsFromEvents(token, serviceId, formattedDate, formattedDate);
-      availableTimes = timesMap.get(formattedDate) || [];
-    } else {
-      // For regular services: use getStartTimeMatrix
-      availableTimes = await getSlotsFromTimeMatrix(token, serviceId, formattedDate, performerId, count);
-    }
-
-    // Format slots
-    const slots = availableTimes
-      .sort((a, b) => a.localeCompare(b))
-      .map(timeStr => ({
-        time: timeStr,
-        available: true,
-        id: `${formattedDate}_${timeStr.replace(':', '')}`,
-        timezone: timezoneStr,
-        weekday: weekday,
-        date: formattedDate,
-        datetime: `${formattedDate}T${timeStr}:00`,
-        formatted_time: `${timeStr} ${timezoneStr}`
-      }));
+    const slots = times.map(t => ({
+      time: t,
+      datetime: `${formattedDate}T${t}:00`,
+      id: `${formattedDate}_${t.replace(':', '')}`,
+      available: true
+    }));
 
     return res.json({
       success: true,
       slots,
       metadata: {
-        date: formattedDate,
-        timezone: timezoneStr,
         service_id: serviceId,
-        service_type: serviceType,
-        performer_id: performerId,
-        total_slots: slots.length,
-        count: count || 1
+        date: formattedDate,
+        performer_id: performerId || null,
+        total_slots: slots.length
       }
     });
+
   } catch (error) {
-    console.error('get-slots error:', error.response?.data || error.message);
-    const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch time slots';
-    return res.status(500).json({ success: false, error: errorMsg });
+    console.error('get-slots error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch time slots'
+    });
   }
 });
 
@@ -1428,39 +1410,12 @@ app.post('/api/service-availability', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Start date must be before end date' });
     }
 
-    // Get service details to check type
-    const services = await fetchServicesCached(false);
-    const service = services.find(s => String(s.id) === String(serviceId));
-    
-    if (!service) {
-      return res.status(404).json({ success: false, error: 'Service not found' });
-    }
-
-    const serviceType = service.type || 'service';
+    // ✅ Assume regular service unless explicitly event - NO fetchServicesCached()
+    let serviceType = 'service';
     const availability = [];
 
-    // Use appropriate method based on service type (not both!)
-    if (serviceType === 'event') {
-      // For events/courses: use getEventListPublic
-      const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
-      
-      // Convert map to availability array
-      timesMap.forEach((times, date) => {
-        const dateObj = new Date(date + 'T00:00:00');
-        availability.push({
-          date: date,
-          weekday: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
-          available_slots: times.length,
-          times: times.sort(),
-          slots: times.sort().map(time => ({
-            time: time,
-            datetime: `${date}T${time}:00`,
-            formatted: `${date} ${time}`
-          }))
-        });
-      });
-    } else {
-      // For regular services: use getStartTimeMatrix
+    // ✅ ALWAYS try getStartTimeMatrix first
+    try {
       const response = await callAdminRpc(token, 'getStartTimeMatrix', [
         dateFrom,
         dateTo,
@@ -1501,6 +1456,33 @@ app.post('/api/service-availability', async (req, res) => {
           });
         }
       });
+    } catch (matrixError) {
+      console.warn('getStartTimeMatrix failed, trying event fallback');
+    }
+
+    // 🔁 fallback for events (only if no availability from matrix)
+    if (availability.length === 0) {
+      try {
+        const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
+        timesMap.forEach((times, date) => {
+          if (times.length > 0) {
+            const dateObj = new Date(date + 'T00:00:00');
+            availability.push({
+              date: date,
+              weekday: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
+              available_slots: times.length,
+              times: times.sort(),
+              slots: times.sort().map(time => ({
+                time: time,
+                datetime: `${date}T${time}:00`,
+                formatted: `${date} ${time}`
+              }))
+            });
+          }
+        });
+      } catch (eventError) {
+        console.warn('Event fallback also failed');
+      }
     }
 
     // Sort dates chronologically
@@ -1567,6 +1549,12 @@ app.post('/api/create-booking', async (req, res) => {
 
     // Extract booking information from response
     const bookingResult = result.bookingResp?.result || result.bookingResp;
+    
+    // Check if booking actually succeeded
+    if (result.bookingResp?.error) {
+      throw new Error(result.bookingResp.error.message || 'Booking failed');
+    }
+    
     const bookings = bookingResult?.bookings || [];
     const bookingId = bookings.length > 0 ? bookings[0].id : bookingResult?.id || null;
     const bookingHash = bookings.length > 0 ? bookings[0].hash : bookingResult?.hash || null;
