@@ -716,6 +716,7 @@ app.get('/', (req, res) => {
       sb_services_list: '/api/sb/services-list',
       // Availability endpoints
       service_availability: 'POST /api/service-availability - Get available dates with time slots for a service',
+      category_availability: 'POST /api/category-availability - Get available dates and slots for a whole category',
       work_calendar: 'POST /api/work-calendar - Get the monthly work calendar for UI hints',
       // Booking endpoints
       create_booking: 'POST /api/create-booking - Create a booking in SimplyBook',
@@ -1119,6 +1120,83 @@ app.post('/api/service-availability', async (req, res) => {
     console.error('service-availability error:', error.response?.data || error.message);
     const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch service availability';
     return res.status(500).json({ success: false, error: errorMsg });
+  }
+});
+
+app.post('/api/category-availability', async (req, res) => {
+  try {
+    const { categoryId, startDate, endDate, performerId, count } = req.body || {};
+    if (!categoryId) return res.status(400).json({ success: false, error: 'Category ID is required' });
+
+    const token = await getSimplyBookTokenCached();
+    const allServices = await fetchServicesCached(false);
+    const categoryServices = allServices.filter(s => String(s.category_id) === String(categoryId));
+
+    if (categoryServices.length === 0) {
+      return res.json({ success: true, availability: [], message: 'No services found for this category' });
+    }
+
+    let dateFrom = startDate;
+    let dateTo = endDate;
+    if (!dateFrom) {
+      dateFrom = new Date().toISOString().split('T')[0];
+    }
+    if (!dateTo) {
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + 30);
+      dateTo = futureDate.toISOString().split('T')[0];
+    }
+
+    const aggregatedAvailability = new Map();
+
+    for (const service of categoryServices) {
+      let serviceAvailability = [];
+      try {
+        const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
+          dateFrom,
+          dateTo,
+          parseInt(service.id, 10),
+          performerId ? parseInt(performerId, 10) : null,
+          count ? parseInt(count, 10) : 1
+        ]);
+        serviceAvailability = normalizeTimeMatrix(matrixResp.result);
+      } catch (_) {}
+
+      if (serviceAvailability.length === 0) {
+        const timesMap = await getSlotsFromEvents(token, service.id, dateFrom, dateTo);
+        timesMap.forEach((times, date) => {
+          serviceAvailability.push({ date, times: times.sort(), available_slots: times.length });
+        });
+      }
+
+      serviceAvailability.forEach(day => {
+        if (aggregatedAvailability.has(day.date)) {
+          const existingDay = aggregatedAvailability.get(day.date);
+          const newTimes = day.times.filter(t => !existingDay.times.includes(t));
+          existingDay.times.push(...newTimes);
+          existingDay.times.sort();
+          existingDay.available_slots = existingDay.times.length;
+        } else {
+          aggregatedAvailability.set(day.date, { ...day });
+        }
+      });
+    }
+
+    const availability = Array.from(aggregatedAvailability.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+    return res.json({
+      success: true,
+      category_id: categoryId,
+      date_range: { from: dateFrom, to: dateTo },
+      availability,
+      available_dates: availability.map(a => a.date),
+      total_dates: availability.length,
+      total_slots: availability.reduce((s, d) => s + d.available_slots, 0)
+    });
+
+  } catch (error) {
+    console.error('category-availability error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch category availability' });
   }
 });
 
