@@ -346,57 +346,74 @@ async function createSimplyBookBooking({ serviceId, performerId, datetime, clien
     }
   }
 
-  const bookingPayload = {
-    service_id: parseInt(serviceId, 10),
-    unit_id: Number.isFinite(resolvedPerformerId) ? resolvedPerformerId : null,
-    start_date: startDate,
-    start_time: startTime,
-    client_data: {
-      name: clientData.full_name,
-      email: clientData.email,
-      phone: clientData.phone
-    },
-    additional_fields: additionalFields || {
-      city: clientData.city || '',
-      country: clientData.country || '',
-      wellness_priority: clientData.wellness_priority || '',
-      consultation_type: clientData.consultation_type || 'in-person',
-      translator: clientData.translator || 'no',
-      hear_about: clientData.hear_about || '',
-      consultation_package: clientData.consultation_package || '',
-      location_name: clientData.location_name || '',
-      location_address: clientData.location_address || '',
-      online_meeting: clientData.online_meeting || false,
-      meeting_url: clientData.meeting_url || '',
-      preferred_time_slot: startTime,
-      booking_timezone: clientData.timezone || 'UTC'
-    },
-    count: 1
+  // Prepare client data according to SimplyBook API format
+  const clientDataForBooking = {
+    name: clientData.full_name || clientData.name || '',
+    email: clientData.email || '',
+    phone: clientData.phone || clientData.phone_number || '',
+    ...(clientData.client_id && { client_id: parseInt(clientData.client_id, 10) })
   };
+
+  // Prepare additional fields (merge with provided additionalFields)
+  const mergedAdditionalFields = {
+    ...(additionalFields || {}),
+    ...(clientData.city && { city: clientData.city }),
+    ...(clientData.country && { country: clientData.country }),
+    ...(clientData.wellness_priority && { wellness_priority: clientData.wellness_priority }),
+    ...(clientData.consultation_type && { consultation_type: clientData.consultation_type }),
+    ...(clientData.translator && { translator: clientData.translator }),
+    ...(clientData.hear_about && { hear_about: clientData.hear_about }),
+    ...(clientData.consultation_package && { consultation_package: clientData.consultation_package }),
+    ...(clientData.location_name && { location_name: clientData.location_name }),
+    ...(clientData.location_address && { location_address: clientData.location_address }),
+    ...(clientData.online_meeting !== undefined && { online_meeting: clientData.online_meeting }),
+    ...(clientData.meeting_url && { meeting_url: clientData.meeting_url }),
+    ...(clientData.timezone && { booking_timezone: clientData.timezone })
+  };
+
+  // SimplyBook book method signature: book(eventId, unitId, date, time, clientData, additional, count)
+  const eventId = parseInt(serviceId, 10);
+  const unitId = Number.isFinite(resolvedPerformerId) ? resolvedPerformerId : null;
+  const count = 1;
 
   let bookingResp;
   try {
+    // Primary booking method using official SimplyBook API
     bookingResp = await callAdminRpc(token, 'book', [
-      bookingPayload.service_id,
-      bookingPayload.unit_id,
-      bookingPayload.start_date,
-      bookingPayload.start_time,
-      bookingPayload.client_data,
-      bookingPayload.additional_fields,
-      bookingPayload.count
+      eventId,              // service/event ID
+      unitId,               // performer/unit ID (can be null for any performer)
+      startDate,            // date in YYYY-MM-DD format
+      startTime,            // time in HH:MM format
+      clientDataForBooking, // client data object
+      mergedAdditionalFields, // additional fields object
+      count                 // number of bookings
     ]);
+
+    // Validate response
+    if (!bookingResp || (bookingResp.error && !bookingResp.result)) {
+      throw new Error(bookingResp?.error?.message || 'Booking failed - no result returned');
+    }
   } catch (e1) {
+    console.error('Primary book method failed, trying fallback:', e1.message);
+    // Fallback: try using bookSession if available (some SimplyBook setups may use this)
     try {
-      const fallbackPayload = {
-        service_id: bookingPayload.service_id,
-        client_id: parseInt(clientId, 10),
-        start_datetime: datetime,
-        end_datetime: new Date(new Date(datetime).getTime() + 60 * 60 * 1000).toISOString(),
-        additional_fields: bookingPayload.additional_fields
-      };
-      bookingResp = await callAdminRpc(token, 'bookSession', [fallbackPayload]);
+      const endDateTimeObj = new Date(`${startDate}T${startTime}:00`);
+      // Estimate end time based on service duration (default 60 minutes if not known)
+      const durationMinutes = 60; // Could fetch from service details if needed
+      endDateTimeObj.setMinutes(endDateTimeObj.getMinutes() + durationMinutes);
+      const endDateTime = endDateTimeObj.toISOString().replace('T', ' ').substring(0, 16);
+
+      bookingResp = await callAdminRpc(token, 'bookSession', [{
+        service_id: eventId,
+        client_id: clientId ? parseInt(clientId, 10) : null,
+        start_datetime: `${startDate} ${startTime}:00`,
+        end_datetime: endDateTime,
+        additional_fields: mergedAdditionalFields
+      }]);
     } catch (e2) {
-      throw e2;
+      // If both methods fail, throw the original error with context
+      const errorMsg = e1.response?.data?.error?.message || e1.message || 'Booking creation failed';
+      throw new Error(`Failed to create booking: ${errorMsg}. Fallback also failed: ${e2.message}`);
     }
   }
 
@@ -561,7 +578,17 @@ app.get('/', (req, res) => {
       health: '/api/health',
       services: '/api/services',
       sb_services: '/api/sb/services',
-      sb_services_list: '/api/sb/services-list'
+      sb_services_list: '/api/sb/services-list',
+      // Availability endpoints
+      service_availability: 'POST /api/service-availability - Get available dates with time slots for a service',
+      service_available_dates: 'POST /api/service-available-dates - Get available dates for a service',
+      get_slots: 'POST /api/get-slots - Get available time slots for a specific date',
+      available_dates: 'POST /api/available-dates - Get available dates for a month (work calendar)',
+      // Booking endpoints
+      create_booking: 'POST /api/create-booking - Create a booking in SimplyBook',
+      // Other endpoints
+      performers: 'GET /api/performers - Get list of performers/units',
+      first_working_day: 'POST /api/first-working-day - Get first available working day'
     }
   });
 });
@@ -772,6 +799,98 @@ app.post('/api/available-dates', async (req, res) => {
   }
 });
 
+// Get available dates for a specific service (checks which dates have available time slots)
+app.post('/api/service-available-dates', async (req, res) => {
+  try {
+    const { serviceId, startDate, endDate, performerId, count } = req.body || {};
+    if (!serviceId) return res.status(400).json({ success: false, error: 'Service ID is required' });
+
+    const token = await getSimplyBookTokenCached();
+    
+    // Set default date range (next 30 days)
+    let dateFrom = startDate;
+    let dateTo = endDate;
+    if (!dateFrom) {
+      const today = new Date();
+      dateFrom = today.toISOString().split('T')[0];
+    }
+    if (!dateTo) {
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + 30);
+      dateTo = futureDate.toISOString().split('T')[0];
+    }
+
+    // Validate dates
+    const fromDate = new Date(dateFrom);
+    const toDate = new Date(dateTo);
+    if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    if (fromDate > toDate) {
+      return res.status(400).json({ success: false, error: 'Start date must be before end date' });
+    }
+
+    const serviceIdInt = parseInt(serviceId, 10);
+    const performerIdInt = performerId ? parseInt(performerId, 10) : null;
+    const countInt = count ? parseInt(count, 10) : 1;
+
+    // Use getStartTimeMatrix to get available slots across date range
+    const response = await callAdminRpc(token, 'getStartTimeMatrix', [
+      dateFrom,
+      dateTo,
+      serviceIdInt,
+      performerIdInt,
+      countInt
+    ]);
+
+    const matrix = response.result || {};
+    const available_dates = [];
+
+    // Extract dates that have available time slots
+    Object.keys(matrix).forEach(date => {
+      const times = matrix[date];
+      if (Array.isArray(times) && times.length > 0) {
+        // Filter out empty or invalid times
+        const validTimes = times.filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)));
+        if (validTimes.length > 0) {
+          available_dates.push({
+            date: date,
+            available_slots: validTimes.length,
+            times: validTimes.map(t => typeof t === 'string' ? t : (t.time || t.start_time))
+          });
+        }
+      } else if (typeof times === 'object' && times !== null) {
+        // Handle object format
+        const timesArray = Object.values(times).flat();
+        if (timesArray.length > 0) {
+          available_dates.push({
+            date: date,
+            available_slots: timesArray.length,
+            times: timesArray.map(t => typeof t === 'string' ? t : (t.time || t.start_time))
+          });
+        }
+      }
+    });
+
+    // Sort dates chronologically
+    available_dates.sort((a, b) => a.date.localeCompare(b.date));
+
+    return res.json({
+      success: true,
+      service_id: serviceId,
+      performer_id: performerId,
+      date_range: { from: dateFrom, to: dateTo },
+      available_dates: available_dates.map(d => d.date),
+      dates_with_details: available_dates,
+      total_dates: available_dates.length
+    });
+  } catch (error) {
+    console.error('service-available-dates error:', error.response?.data || error.message);
+    const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch available dates for service';
+    return res.status(500).json({ success: false, error: errorMsg });
+  }
+});
+
 // Get performers/units list (using official getUnitList method)
 app.get('/api/performers', async (req, res) => {
   try {
@@ -932,73 +1051,265 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
   }
 });
 
-// Get Available Time Slots (using official getStartTimeMatrix method)
+// Get Available Time Slots for a specific date and service (using official getStartTimeMatrix method)
 app.post('/api/get-slots', async (req, res) => {
   try {
-    const { serviceId, date, performerId, timezone } = req.body;
+    const { serviceId, date, performerId, timezone, count } = req.body;
     if (!serviceId || !date) return res.status(400).json({ success: false, error: 'Service ID and date are required' });
 
     const token = await getSimplyBookTokenCached();
-    const dateObj = new Date(date);
-    if (isNaN(dateObj)) return res.status(400).json({ success: false, error: 'Invalid date' });
-    const formattedDate = dateObj.toISOString().split('T')[0];
+    
+    // Parse and validate date
+    let dateObj;
+    let formattedDate;
+    if (typeof date === 'string') {
+      // Handle ISO date string or YYYY-MM-DD format
+      const dateMatch = date.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (dateMatch) {
+        formattedDate = dateMatch[1];
+        dateObj = new Date(formattedDate + 'T00:00:00');
+      } else {
+        dateObj = new Date(date);
+        formattedDate = dateObj.toISOString().split('T')[0];
+      }
+    } else {
+      dateObj = new Date(date);
+      formattedDate = dateObj.toISOString().split('T')[0];
+    }
+    
+    if (isNaN(dateObj.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid date format' });
+    }
 
-    // Use official getStartTimeMatrix method with performer support
-    const rpcPayload = {
-      jsonrpc: '2.0',
-      method: 'getStartTimeMatrix',
-      params: [formattedDate, formattedDate, parseInt(serviceId, 10), performerId || null, 1],
-      id: 1
-    };
+    // Use official getStartTimeMatrix method: getStartTimeMatrix(dateFrom, dateTo, eventId, unitId, count)
+    const serviceIdInt = parseInt(serviceId, 10);
+    const performerIdInt = performerId ? parseInt(performerId, 10) : null;
+    const countInt = count ? parseInt(count, 10) : 1;
 
-    const response = await callAdminRpc(token, 'getStartTimeMatrix', [formattedDate, formattedDate, parseInt(serviceId, 10), performerId || null, 1]);
+    const response = await callAdminRpc(token, 'getStartTimeMatrix', [
+      formattedDate,  // dateFrom
+      formattedDate,  // dateTo (same day for single date query)
+      serviceIdInt,   // eventId (service ID)
+      performerIdInt, // unitId (performer/provider ID, null for any)
+      countInt        // count (number of bookings)
+    ]);
 
     const matrix = response.result || {};
     const times = matrix[formattedDate] || [];
+    
+    // Handle case where matrix might be an array or object
+    let availableTimes = [];
+    if (Array.isArray(times)) {
+      availableTimes = times;
+    } else if (typeof times === 'object' && times !== null) {
+      // If it's an object, try to extract times
+      availableTimes = Object.values(times).flat();
+    }
+
     const weekday = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
+    const timezoneStr = timezone || 'UTC';
 
     // Enhanced slot information with timezone support
-    const slots = times.map(t => ({
-      time: t,
-      available: true,
-      id: `${formattedDate} ${t}`,
-      timezone: timezone || 'UTC',
-      weekday: weekday,
-      date: formattedDate,
-      formatted_time: `${t} ${timezone || 'UTC'}`
-    }));
+    const slots = availableTimes.map(t => {
+      const timeStr = typeof t === 'string' ? t : (t.time || t.start_time || '');
+      return {
+        time: timeStr,
+        available: true,
+        id: `${formattedDate}_${timeStr.replace(':', '')}`,
+        timezone: timezoneStr,
+        weekday: weekday,
+        date: formattedDate,
+        datetime: `${formattedDate}T${timeStr}:00`,
+        formatted_time: `${timeStr} ${timezoneStr}`
+      };
+    }).filter(slot => slot.time); // Filter out empty times
 
     return res.json({
       success: true,
       slots,
       metadata: {
         date: formattedDate,
-        timezone: timezone || 'UTC',
+        timezone: timezoneStr,
         service_id: serviceId,
         performer_id: performerId,
-        total_slots: slots.length
+        total_slots: slots.length,
+        count: countInt
       }
     });
   } catch (error) {
     console.error('get-slots error:', error.response?.data || error.message);
-    return res.status(500).json({ success: false, error: error.response?.data?.message || 'Failed to fetch time slots' });
+    const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch time slots';
+    return res.status(500).json({ success: false, error: errorMsg });
+  }
+});
+
+// Get available dates with time slots for a service (combined endpoint for convenience)
+app.post('/api/service-availability', async (req, res) => {
+  try {
+    const { serviceId, startDate, endDate, performerId, count } = req.body || {};
+    if (!serviceId) return res.status(400).json({ success: false, error: 'Service ID is required' });
+
+    const token = await getSimplyBookTokenCached();
+    
+    // Set default date range (next 30 days)
+    let dateFrom = startDate;
+    let dateTo = endDate;
+    if (!dateFrom) {
+      const today = new Date();
+      dateFrom = today.toISOString().split('T')[0];
+    }
+    if (!dateTo) {
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + 30);
+      dateTo = futureDate.toISOString().split('T')[0];
+    }
+
+    // Validate dates
+    const fromDate = new Date(dateFrom);
+    const toDate = new Date(dateTo);
+    if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    if (fromDate > toDate) {
+      return res.status(400).json({ success: false, error: 'Start date must be before end date' });
+    }
+
+    const serviceIdInt = parseInt(serviceId, 10);
+    const performerIdInt = performerId ? parseInt(performerId, 10) : null;
+    const countInt = count ? parseInt(count, 10) : 1;
+
+    // Get time matrix for the entire date range
+    const response = await callAdminRpc(token, 'getStartTimeMatrix', [
+      dateFrom,
+      dateTo,
+      serviceIdInt,
+      performerIdInt,
+      countInt
+    ]);
+
+    const matrix = response.result || {};
+    const availability = [];
+
+    // Process each date that has available slots
+    Object.keys(matrix).forEach(date => {
+      const times = matrix[date];
+      let availableTimes = [];
+      
+      if (Array.isArray(times) && times.length > 0) {
+        availableTimes = times.filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)))
+          .map(t => typeof t === 'string' ? t : (t.time || t.start_time));
+      } else if (typeof times === 'object' && times !== null) {
+        const timesArray = Object.values(times).flat();
+        availableTimes = timesArray
+          .filter(t => t && (typeof t === 'string' ? t.trim() : (t.time || t.start_time)))
+          .map(t => typeof t === 'string' ? t : (t.time || t.start_time));
+      }
+
+      if (availableTimes.length > 0) {
+        const dateObj = new Date(date + 'T00:00:00');
+        availability.push({
+          date: date,
+          weekday: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
+          available_slots: availableTimes.length,
+          times: availableTimes.sort(),
+          slots: availableTimes.map(time => ({
+            time: time,
+            datetime: `${date}T${time}:00`,
+            formatted: `${date} ${time}`
+          }))
+        });
+      }
+    });
+
+    // Sort dates chronologically
+    availability.sort((a, b) => a.date.localeCompare(b.date));
+
+    return res.json({
+      success: true,
+      service_id: serviceId,
+      performer_id: performerId,
+      date_range: { from: dateFrom, to: dateTo },
+      availability: availability,
+      total_dates: availability.length,
+      total_slots: availability.reduce((sum, day) => sum + day.available_slots, 0)
+    });
+  } catch (error) {
+    console.error('service-availability error:', error.response?.data || error.message);
+    const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch service availability';
+    return res.status(500).json({ success: false, error: errorMsg });
   }
 });
 
 // Create Booking (using official book method)
 app.post('/api/create-booking', async (req, res) => {
   try {
-    const result = await createSimplyBookBooking(req.body);
+    const {
+      serviceId,
+      performerId,
+      datetime,
+      date,
+      time,
+      clientData,
+      additionalFields,
+      count
+    } = req.body;
+
+    // Validate required fields
+    if (!serviceId) {
+      return res.status(400).json({ success: false, error: 'serviceId is required' });
+    }
+
+    // Handle datetime format: can be full datetime string or separate date/time
+    let bookingDateTime = datetime;
+    if (!bookingDateTime && date && time) {
+      bookingDateTime = `${date}T${time}`;
+    }
+    if (!bookingDateTime) {
+      return res.status(400).json({ success: false, error: 'datetime (or date+time) is required' });
+    }
+
+    if (!clientData || !clientData.email || !clientData.full_name) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'clientData with email and full_name is required' 
+      });
+    }
+
+    const result = await createSimplyBookBooking({
+      serviceId,
+      performerId,
+      datetime: bookingDateTime,
+      clientData,
+      additionalFields
+    });
+
+    // Extract booking information from response
+    const bookingResult = result.bookingResp?.result || result.bookingResp;
+    const bookings = bookingResult?.bookings || [];
+    const bookingId = bookings.length > 0 ? bookings[0].id : bookingResult?.id || null;
+    const bookingHash = bookings.length > 0 ? bookings[0].hash : bookingResult?.hash || null;
+
     return res.json({
       success: true,
-      booking: result.bookingResp,
+      booking_id: bookingId,
+      booking_hash: bookingHash,
+      booking: bookingResult,
       confirmations: result.confirmations,
       message: 'Booking created successfully',
-      booking_details: result.booking_details
+      booking_details: result.booking_details,
+      raw_response: result.bookingResp
     });
   } catch (error) {
     console.error('create-booking error:', error.response?.data || error.message);
-    return res.status(500).json({ success: false, error: error.response?.data?.message || 'Failed to create booking' });
+    const errorMsg = error.response?.data?.error?.message || 
+                     error.response?.data?.message || 
+                     error.message || 
+                     'Failed to create booking';
+    return res.status(500).json({ 
+      success: false, 
+      error: errorMsg,
+      details: error.response?.data || null
+    });
   }
 });
 
