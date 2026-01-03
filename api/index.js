@@ -490,6 +490,22 @@ async function callPublicRpc(method, params = [], timeout = 15000) {
 }
 
 // ---------------- Availability helpers ----------------
+// Helper to detect special-day services
+async function isSpecialDayService(token, serviceId) {
+  try {
+    const resp = await callAdminRpc(token, 'getEventList', []);
+    const events = Array.isArray(resp.result)
+      ? resp.result
+      : Object.values(resp.result || {});
+
+    return events.some(e =>
+      String(e.id || e.service_id) === String(serviceId)
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
 // Get slots using getStartTimeMatrix (for regular services)
 async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count = 1) {
   const serviceIdInt = parseInt(serviceId, 10);
@@ -1048,49 +1064,41 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
 app.post('/api/service-availability', async (req, res) => {
   try {
     const { serviceId, startDate, endDate, performerId, count } = req.body || {};
-    if (!serviceId) return res.status(400).json({ success: false, error: 'Service ID is required' });
+    if (!serviceId) {
+      return res.status(400).json({ success: false, error: 'Service ID is required' });
+    }
 
     const token = await getSimplyBookTokenCached();
-    
-    // Set default date range (next 30 days)
-    let dateFrom = startDate;
-    let dateTo = endDate;
-    if (!dateFrom) {
-      const today = new Date();
-      dateFrom = today.toISOString().split('T')[0];
+
+    let dateFrom = startDate || new Date().toISOString().split('T')[0];
+    let dateTo = endDate || (() => {
+      const d = new Date();
+      d.setDate(d.getDate() + 60);
+      return d.toISOString().split('T')[0];
+    })();
+
+    const availability = [];
+
+    // ✅ Detect special-day services
+    const specialDayService = await isSpecialDayService(token, serviceId);
+
+    // ✅ Regular recurring service
+    if (!specialDayService) {
+      try {
+        const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
+          dateFrom,
+          dateTo,
+          parseInt(serviceId, 10),
+          performerId ? parseInt(performerId, 10) : null,
+          count ? parseInt(count, 10) : 1
+        ]);
+
+        const matrixAvailability = normalizeTimeMatrix(matrixResp.result);
+        availability.push(...matrixAvailability);
+      } catch (_) {}
     }
-    if (!dateTo) {
-      const futureDate = new Date();
-      futureDate.setDate(futureDate.getDate() + 30);
-      dateTo = futureDate.toISOString().split('T')[0];
-    }
 
-    // Validate dates
-    const fromDate = new Date(dateFrom);
-    const toDate = new Date(dateTo);
-    if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
-      return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
-    }
-    if (fromDate > toDate) {
-      return res.status(400).json({ success: false, error: 'Start date must be before end date' });
-    }
-
-    // ✅ ALWAYS try getStartTimeMatrix first
-    let availability = [];
-
-    try {
-      const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
-        dateFrom,
-        dateTo,
-        parseInt(serviceId, 10),
-        performerId ? parseInt(performerId, 10) : null,
-        count ? parseInt(count, 10) : 1
-      ]);
-
-      availability = normalizeTimeMatrix(matrixResp.result);
-    } catch (_) {}
-
-    // 🔁 Event fallback (ONLY if empty)
+    // ✅ Special-day OR fallback → event-based slots
     if (availability.length === 0) {
       const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
 
@@ -1103,23 +1111,24 @@ app.post('/api/service-availability', async (req, res) => {
       });
     }
 
-    // Sort dates chronologically
     availability.sort((a, b) => a.date.localeCompare(b.date));
 
     return res.json({
       success: true,
       service_id: serviceId,
-      performer_id: performerId || null,
       date_range: { from: dateFrom, to: dateTo },
       availability,
       available_dates: availability.map(a => a.date),
       total_dates: availability.length,
       total_slots: availability.reduce((s, d) => s + d.available_slots, 0)
     });
+
   } catch (error) {
-    console.error('service-availability error:', error.response?.data || error.message);
-    const errorMsg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to fetch service availability';
-    return res.status(500).json({ success: false, error: errorMsg });
+    console.error('service-availability error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch availability'
+    });
   }
 });
 
