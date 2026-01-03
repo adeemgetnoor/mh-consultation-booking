@@ -490,25 +490,6 @@ async function callPublicRpc(method, params = [], timeout = 15000) {
 }
 
 // ---------------- Availability helpers ----------------
-// Helper to detect special-day services
-async function isSpecialDayService(token, serviceName) {
-  try {
-    const from = new Date().toISOString().split('T')[0];
-    const to = new Date(Date.now() + 180 * 24 * 3600 * 1000).toISOString().split('T')[0];
-
-    const resp = await callPublicRpc('getEventListPublic', [from, to]);
-    if (!Array.isArray(resp?.result)) return false;
-
-    const normalize = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
-
-    return resp.result.some(e =>
-      e.name && normalize(e.name).includes(normalize(serviceName))
-    );
-  } catch {
-    return false;
-  }
-}
-
 // Get slots using getStartTimeMatrix (for regular services)
 async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count = 1) {
   const serviceIdInt = parseInt(serviceId, 10);
@@ -539,28 +520,32 @@ async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count
 }
 
 // Get slots using getEventListPublic (for events/courses)
-async function getSlotsFromEvents(token, serviceName, dateFrom, dateTo) {
+async function getSlotsFromEvents(token, serviceId, dateFrom, dateTo) {
   const resp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
   if (!Array.isArray(resp?.result)) return new Map();
-
-  const normalize = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
-  const key = normalize(serviceName);
 
   const map = new Map();
 
   resp.result.forEach(e => {
-    if (!e.name || !normalize(e.name).includes(key)) return;
+    const linkedServiceId =
+      e.unit_group_id ||
+      e.service_id ||
+      e.category_id;
+
+    // ✅ STRICT service match
+    if (String(linkedServiceId) !== String(serviceId)) return;
 
     const dt = e.start_datetime || e.datetime;
     if (!dt) return;
 
     const [date, time] = dt.split(' ');
     const t = time?.substring(0, 5);
-
     if (!t) return;
 
     if (!map.has(date)) map.set(date, []);
-    if (!map.get(date).includes(t)) map.get(date).push(t);
+    if (!map.get(date).includes(t)) {
+      map.get(date).push(t);
+    }
   });
 
   return map;
@@ -1047,42 +1032,24 @@ app.post('/api/service-availability', async (req, res) => {
 
     const availability = [];
 
-    // ✅ Get service name safely
-    let serviceName = null;
+    // Try regular availability
     try {
-      const services = await fetchServicesCached(false);
-      const svc = services.find(s => String(s.id) === String(serviceId));
-      serviceName = svc?.name || null;
-    } catch {
-      // availability must still work even if services fail
-    }
+      const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
+        dateFrom,
+        dateTo,
+        parseInt(serviceId, 10),
+        performerId ? parseInt(performerId, 10) : null,
+        count ? parseInt(count, 10) : 1
+      ]);
 
-    // ✅ Detect special-day services
-    const specialDayService = serviceName
-      ? await isSpecialDayService(token, serviceName)
-      : true; // fallback to event-based
+      availability.push(...normalizeTimeMatrix(matrixResp.result));
+    } catch (_) {}
 
-    // ✅ Regular recurring service
-    if (!specialDayService) {
-      try {
-        const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
-          dateFrom,
-          dateTo,
-          parseInt(serviceId, 10),
-          performerId ? parseInt(performerId, 10) : null,
-          count ? parseInt(count, 10) : 1
-        ]);
-
-        const matrixAvailability = normalizeTimeMatrix(matrixResp.result);
-        availability.push(...matrixAvailability);
-      } catch (_) {}
-    }
-
-    // ✅ Special-day OR fallback → event-based slots
-    if (availability.length === 0 && serviceName) {
+    // Fallback to events (special days / courses)
+    if (availability.length === 0) {
       const timesMap = await getSlotsFromEvents(
         token,
-        serviceName,
+        serviceId,
         dateFrom,
         dateTo
       );
