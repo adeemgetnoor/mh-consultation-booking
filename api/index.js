@@ -1274,17 +1274,6 @@ app.post('/api/create-payment', async (req, res) => {
   }
 });
 
-// Admin-only: purge caches
-app.post('/api/purge-cache', (req, res) => {
-  const secret = req.headers['x-cache-admin-secret'] || req.body?.admin_secret;
-  if (!process.env.CACHE_ADMIN_SECRET || secret !== process.env.CACHE_ADMIN_SECRET) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
-  }
-  tokenCache = { token: null, fetchedAt: 0, ttlMs: tokenCache.ttlMs };
-  servicesCache = { data: null, fetchedAt: 0, ttlMs: servicesCache.ttlMs };
-  return res.json({ ok: true, message: 'Caches purged' });
-});
-
 module.exports = app;
 
 if (process.env.NODE_ENV !== 'production') {
