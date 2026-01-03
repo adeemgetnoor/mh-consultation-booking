@@ -491,17 +491,18 @@ async function callPublicRpc(method, params = [], timeout = 15000) {
 
 // ---------------- Availability helpers ----------------
 // Helper to detect special-day services
-async function isSpecialDayService(token, serviceId) {
+async function isSpecialDayService(token, serviceName) {
   try {
-    const resp = await callPublicRpc('getEventListPublic', [
-      new Date().toISOString().split('T')[0],
-      new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0]
-    ]);
+    const from = new Date().toISOString().split('T')[0];
+    const to = new Date(Date.now() + 180 * 24 * 3600 * 1000).toISOString().split('T')[0];
 
-    if (!resp?.result || !Array.isArray(resp.result)) return false;
+    const resp = await callPublicRpc('getEventListPublic', [from, to]);
+    if (!Array.isArray(resp?.result)) return false;
+
+    const normalize = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
 
     return resp.result.some(e =>
-      e.name && e.name.includes('Vaidya') // or partial match
+      e.name && normalize(e.name).includes(normalize(serviceName))
     );
   } catch {
     return false;
@@ -538,12 +539,12 @@ async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count
 }
 
 // Get slots using getEventListPublic (for events/courses)
-async function getSlotsFromEvents(token, keyword, dateFrom, dateTo) {
+async function getSlotsFromEvents(token, serviceName, dateFrom, dateTo) {
   const resp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
-  if (!resp?.result) return new Map();
+  if (!Array.isArray(resp?.result)) return new Map();
 
   const normalize = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
-  const key = normalize(keyword);
+  const key = normalize(serviceName);
 
   const map = new Map();
 
@@ -556,10 +557,10 @@ async function getSlotsFromEvents(token, keyword, dateFrom, dateTo) {
     const [date, time] = dt.split(' ');
     const t = time?.substring(0, 5);
 
-    if (date >= dateFrom && date <= dateTo && t) {
-      if (!map.has(date)) map.set(date, []);
-      if (!map.get(date).includes(t)) map.get(date).push(t);
-    }
+    if (!t) return;
+
+    if (!map.has(date)) map.set(date, []);
+    if (!map.get(date).includes(t)) map.get(date).push(t);
   });
 
   return map;
@@ -1046,8 +1047,20 @@ app.post('/api/service-availability', async (req, res) => {
 
     const availability = [];
 
+    // ✅ Get service name safely
+    let serviceName = null;
+    try {
+      const services = await fetchServicesCached(false);
+      const svc = services.find(s => String(s.id) === String(serviceId));
+      serviceName = svc?.name || null;
+    } catch {
+      // availability must still work even if services fail
+    }
+
     // ✅ Detect special-day services
-    const specialDayService = await isSpecialDayService(token, serviceId);
+    const specialDayService = serviceName
+      ? await isSpecialDayService(token, serviceName)
+      : true; // fallback to event-based
 
     // ✅ Regular recurring service
     if (!specialDayService) {
@@ -1066,10 +1079,10 @@ app.post('/api/service-availability', async (req, res) => {
     }
 
     // ✅ Special-day OR fallback → event-based slots
-    if (availability.length === 0) {
+    if (availability.length === 0 && serviceName) {
       const timesMap = await getSlotsFromEvents(
         token,
-        "Vaidya Consultation", // keyword
+        serviceName,
         dateFrom,
         dateTo
       );
