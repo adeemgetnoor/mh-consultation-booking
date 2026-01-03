@@ -493,17 +493,14 @@ async function callPublicRpc(method, params = [], timeout = 15000) {
 // Helper to detect special-day services
 async function isSpecialDayService(token, serviceId) {
   try {
-    const services = await fetchServicesCached(false);
-    const service = services.find(s => String(s.id) === String(serviceId));
-    if (!service) return false;
-
     const resp = await callAdminRpc(token, 'getEventList', []);
     const events = Array.isArray(resp.result)
       ? resp.result
       : Object.values(resp.result || {});
 
+    // Special-day services always create events
     return events.some(e =>
-      e.name && service.name && e.name.trim() === service.name.trim()
+      String(e.service_id || e.unit_group_id || '') === String(serviceId)
     );
   } catch (e) {
     return false;
@@ -540,65 +537,29 @@ async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count
 }
 
 // Get slots using getEventListPublic (for events/courses)
-async function getSlotsFromEvents(token, serviceName, dateFrom, dateTo) {
+async function getSlotsFromEvents(token, serviceId, dateFrom, dateTo) {
   const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
-  
-  if (!eventListResp || !eventListResp.result || !Array.isArray(eventListResp.result)) {
-    return new Map();
-  }
+  if (!eventListResp?.result) return new Map();
 
-  // Filter events matching service name and date range
-  const matchingEvents = eventListResp.result.filter(event => {
-    if (!event.name || !serviceName) return false;
-    if (event.name.trim() !== serviceName.trim()) return false;
-    
-    let eventDate = event.date || event.start_date || event.occurrence_date;
-    if (!eventDate && (event.start_datetime || event.datetime)) {
-      const dtStr = event.start_datetime || event.datetime;
-      eventDate = typeof dtStr === 'string' ? dtStr.split('T')[0] : new Date(dtStr).toISOString().split('T')[0];
-    }
-    
-    if (eventDate) {
-      const eventDateStr = typeof eventDate === 'string' ? eventDate.split('T')[0] : new Date(eventDate).toISOString().split('T')[0];
-      return eventDateStr >= dateFrom && eventDateStr <= dateTo;
-    }
-    return false;
-  });
+  const timesMap = new Map();
 
-  // Extract times from matching events
-  const timesMap = new Map(); // date -> [times]
-  
-  matchingEvents.forEach(event => {
-    let eventDate = event.date || event.start_date || event.occurrence_date;
-    let eventTime = event.start_time || event.time;
-    
-    if (!eventDate && (event.start_datetime || event.datetime)) {
-      const dtStr = event.start_datetime || event.datetime;
-      eventDate = typeof dtStr === 'string' ? dtStr.split('T')[0] : new Date(dtStr).toISOString().split('T')[0];
-    }
-    
-    if (!eventTime && (event.start_datetime || event.datetime)) {
-      const dtStr = event.start_datetime || event.datetime;
-      if (typeof dtStr === 'string') {
-        const timeMatch = dtStr.match(/(\d{2}:\d{2})/);
-        eventTime = timeMatch ? timeMatch[1] : null;
-      }
-    }
+  eventListResp.result.forEach(event => {
+    const linkedServiceId = event.service_id || event.unit_group_id;
+    if (String(linkedServiceId) !== String(serviceId)) return;
 
-    if (eventDate && eventTime) {
-      const dateStr = typeof eventDate === 'string' ? eventDate.split('T')[0] : new Date(eventDate).toISOString().split('T')[0];
-      const timeStr = typeof eventTime === 'string' ? eventTime.substring(0, 5) : String(eventTime).substring(0, 5);
-      
-      if (!timesMap.has(dateStr)) {
-        timesMap.set(dateStr, []);
-      }
-      if (!timesMap.get(dateStr).includes(timeStr)) {
-        timesMap.get(dateStr).push(timeStr);
-      }
+    const dt = event.start_datetime || event.datetime;
+    if (!dt) return;
+
+    const [date, time] = dt.replace('T', ' ').split(' ');
+    const t = time?.substring(0, 5);
+
+    if (!timesMap.has(date)) timesMap.set(date, []);
+    if (t && !timesMap.get(date).includes(t)) {
+      timesMap.get(date).push(t);
     }
   });
 
-  return timesMap; // Returns Map<date, [times]>
+  return timesMap;
 }
 
 // ---------------- Fetch services only from SimplyBook ----------------
@@ -1103,20 +1064,15 @@ app.post('/api/service-availability', async (req, res) => {
 
     // ✅ Special-day OR fallback → event-based slots
     if (availability.length === 0) {
-      const services = await fetchServicesCached(false);
-      const service = services.find(s => String(s.id) === String(serviceId));
-      
-      if (service) {
-        const timesMap = await getSlotsFromEvents(token, service.name, dateFrom, dateTo);
+      const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
 
-        timesMap.forEach((times, date) => {
-          availability.push({
-            date,
-            times: times.sort(),
-            available_slots: times.length
-          });
+      timesMap.forEach((times, date) => {
+        availability.push({
+          date,
+          times: times.sort(),
+          available_slots: times.length
         });
-      }
+      });
     }
 
     availability.sort((a, b) => a.date.localeCompare(b.date));
