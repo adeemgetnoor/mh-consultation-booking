@@ -493,13 +493,17 @@ async function callPublicRpc(method, params = [], timeout = 15000) {
 // Helper to detect special-day services
 async function isSpecialDayService(token, serviceId) {
   try {
+    const services = await fetchServicesCached(false);
+    const service = services.find(s => String(s.id) === String(serviceId));
+    if (!service) return false;
+
     const resp = await callAdminRpc(token, 'getEventList', []);
     const events = Array.isArray(resp.result)
       ? resp.result
       : Object.values(resp.result || {});
 
     return events.some(e =>
-      String(e.id || e.service_id) === String(serviceId)
+      e.name && service.name && e.name.trim() === service.name.trim()
     );
   } catch (e) {
     return false;
@@ -536,18 +540,17 @@ async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count
 }
 
 // Get slots using getEventListPublic (for events/courses)
-async function getSlotsFromEvents(token, serviceId, dateFrom, dateTo) {
-  const serviceIdInt = parseInt(serviceId, 10);
+async function getSlotsFromEvents(token, serviceName, dateFrom, dateTo) {
   const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
   
   if (!eventListResp || !eventListResp.result || !Array.isArray(eventListResp.result)) {
     return new Map();
   }
 
-  // Filter events matching service ID and date range
+  // Filter events matching service name and date range
   const matchingEvents = eventListResp.result.filter(event => {
-    const eventId = event.id || event.event_id || event.service_id;
-    if (parseInt(eventId, 10) !== serviceIdInt) return false;
+    if (!event.name || !serviceName) return false;
+    if (event.name.trim() !== serviceName.trim()) return false;
     
     let eventDate = event.date || event.start_date || event.occurrence_date;
     if (!eventDate && (event.start_datetime || event.datetime)) {
@@ -1100,15 +1103,20 @@ app.post('/api/service-availability', async (req, res) => {
 
     // ✅ Special-day OR fallback → event-based slots
     if (availability.length === 0) {
-      const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
+      const services = await fetchServicesCached(false);
+      const service = services.find(s => String(s.id) === String(serviceId));
+      
+      if (service) {
+        const timesMap = await getSlotsFromEvents(token, service.name, dateFrom, dateTo);
 
-      timesMap.forEach((times, date) => {
-        availability.push({
-          date,
-          times: times.sort(),
-          available_slots: times.length
+        timesMap.forEach((times, date) => {
+          availability.push({
+            date,
+            times: times.sort(),
+            available_slots: times.length
+          });
         });
-      });
+      }
     }
 
     availability.sort((a, b) => a.date.localeCompare(b.date));
