@@ -537,25 +537,41 @@ async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count
 }
 
 // Get slots using getEventListPublic (for events/courses)
-async function getSlotsFromEvents(token, serviceId, dateFrom, dateTo) {
+async function getSlotsFromEvents(token, serviceName, dateFrom, dateTo) {
   const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
-  if (!eventListResp?.result) return new Map();
+  
+  // 🔴 DEBUG: See what SimplyBook actually returns
+  console.log(
+    'EVENT LIST RAW:',
+    JSON.stringify(eventListResp.result, null, 2)
+  );
+  
+  if (!eventListResp?.result || !Array.isArray(eventListResp.result)) {
+    return new Map();
+  }
+
+  const normalize = s =>
+    s.toLowerCase().replace(/\s+/g, ' ').trim();
 
   const timesMap = new Map();
 
   eventListResp.result.forEach(event => {
-    const linkedServiceId = event.service_id || event.unit_group_id;
-    if (String(linkedServiceId) !== String(serviceId)) return;
+    if (!event.name || !serviceName) return;
+
+    // ✅ Robust name match
+    if (!normalize(event.name).includes(normalize(serviceName))) return;
 
     const dt = event.start_datetime || event.datetime;
     if (!dt) return;
 
-    const [date, time] = dt.replace('T', ' ').split(' ');
-    const t = time?.substring(0, 5);
+    const date = dt.split(' ')[0];
+    const time = dt.split(' ')[1]?.substring(0, 5);
 
-    if (!timesMap.has(date)) timesMap.set(date, []);
-    if (t && !timesMap.get(date).includes(t)) {
-      timesMap.get(date).push(t);
+    if (date >= dateFrom && date <= dateTo && time) {
+      if (!timesMap.has(date)) timesMap.set(date, []);
+      if (!timesMap.get(date).includes(time)) {
+        timesMap.get(date).push(time);
+      }
     }
   });
 
@@ -1064,15 +1080,25 @@ app.post('/api/service-availability', async (req, res) => {
 
     // ✅ Special-day OR fallback → event-based slots
     if (availability.length === 0) {
-      const timesMap = await getSlotsFromEvents(token, serviceId, dateFrom, dateTo);
+      const services = await fetchServicesCached(false);
+      const service = services.find(s => String(s.id) === String(serviceId));
 
-      timesMap.forEach((times, date) => {
-        availability.push({
-          date,
-          times: times.sort(),
-          available_slots: times.length
+      if (service) {
+        const timesMap = await getSlotsFromEvents(
+          token,
+          service.name,
+          dateFrom,
+          dateTo
+        );
+
+        timesMap.forEach((times, date) => {
+          availability.push({
+            date,
+            times: times.sort(),
+            available_slots: times.length
+          });
         });
-      });
+      }
     }
 
     availability.sort((a, b) => a.date.localeCompare(b.date));
