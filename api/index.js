@@ -573,7 +573,7 @@ async function fetchServicesCached(forceRefresh = false) {
     return servicesCache.data;
   }
 
-  // 1) Admin getEventList
+
   try {
     const token = await getSimplyBookTokenCached();
     const adminResp = await callAdminRpc(token, 'getEventList', []);
