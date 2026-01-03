@@ -493,16 +493,17 @@ async function callPublicRpc(method, params = [], timeout = 15000) {
 // Helper to detect special-day services
 async function isSpecialDayService(token, serviceId) {
   try {
-    const resp = await callAdminRpc(token, 'getEventList', []);
-    const events = Array.isArray(resp.result)
-      ? resp.result
-      : Object.values(resp.result || {});
+    const resp = await callPublicRpc('getEventListPublic', [
+      new Date().toISOString().split('T')[0],
+      new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString().split('T')[0]
+    ]);
 
-    // Special-day services always create events
-    return events.some(e =>
-      String(e.service_id || e.unit_group_id || '') === String(serviceId)
+    if (!resp?.result || !Array.isArray(resp.result)) return false;
+
+    return resp.result.some(e =>
+      e.name && e.name.includes('Vaidya') // or partial match
     );
-  } catch (e) {
+  } catch {
     return false;
   }
 }
@@ -537,45 +538,31 @@ async function getSlotsFromTimeMatrix(token, serviceId, date, performerId, count
 }
 
 // Get slots using getEventListPublic (for events/courses)
-async function getSlotsFromEvents(token, serviceName, dateFrom, dateTo) {
-  const eventListResp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
-  
-  // 🔴 DEBUG: See what SimplyBook actually returns
-  console.log(
-    'EVENT LIST RAW:',
-    JSON.stringify(eventListResp.result, null, 2)
-  );
-  
-  if (!eventListResp?.result || !Array.isArray(eventListResp.result)) {
-    return new Map();
-  }
+async function getSlotsFromEvents(token, keyword, dateFrom, dateTo) {
+  const resp = await callPublicRpc('getEventListPublic', [dateFrom, dateTo]);
+  if (!resp?.result) return new Map();
 
-  const normalize = s =>
-    s.toLowerCase().replace(/\s+/g, ' ').trim();
+  const normalize = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  const key = normalize(keyword);
 
-  const timesMap = new Map();
+  const map = new Map();
 
-  eventListResp.result.forEach(event => {
-    if (!event.name || !serviceName) return;
+  resp.result.forEach(e => {
+    if (!e.name || !normalize(e.name).includes(key)) return;
 
-    // ✅ Robust name match
-    if (!normalize(event.name).includes(normalize(serviceName))) return;
-
-    const dt = event.start_datetime || event.datetime;
+    const dt = e.start_datetime || e.datetime;
     if (!dt) return;
 
-    const date = dt.split(' ')[0];
-    const time = dt.split(' ')[1]?.substring(0, 5);
+    const [date, time] = dt.split(' ');
+    const t = time?.substring(0, 5);
 
-    if (date >= dateFrom && date <= dateTo && time) {
-      if (!timesMap.has(date)) timesMap.set(date, []);
-      if (!timesMap.get(date).includes(time)) {
-        timesMap.get(date).push(time);
-      }
+    if (date >= dateFrom && date <= dateTo && t) {
+      if (!map.has(date)) map.set(date, []);
+      if (!map.get(date).includes(t)) map.get(date).push(t);
     }
   });
 
-  return timesMap;
+  return map;
 }
 
 // ---------------- Fetch services only from SimplyBook ----------------
@@ -1080,25 +1067,20 @@ app.post('/api/service-availability', async (req, res) => {
 
     // ✅ Special-day OR fallback → event-based slots
     if (availability.length === 0) {
-      const services = await fetchServicesCached(false);
-      const service = services.find(s => String(s.id) === String(serviceId));
+      const timesMap = await getSlotsFromEvents(
+        token,
+        "Vaidya Consultation", // keyword
+        dateFrom,
+        dateTo
+      );
 
-      if (service) {
-        const timesMap = await getSlotsFromEvents(
-          token,
-          service.name,
-          dateFrom,
-          dateTo
-        );
-
-        timesMap.forEach((times, date) => {
-          availability.push({
-            date,
-            times: times.sort(),
-            available_slots: times.length
-          });
+      timesMap.forEach((times, date) => {
+        availability.push({
+          date,
+          times: times.sort(),
+          available_slots: times.length
         });
-      }
+      });
     }
 
     availability.sort((a, b) => a.date.localeCompare(b.date));
