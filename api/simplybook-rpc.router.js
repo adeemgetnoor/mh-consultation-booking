@@ -74,6 +74,14 @@ router.post('/book', async (req, res) => {
 
         console.log("Sending to SimplyBook:", additionalFields);
 
+        // --- SAFETY LOCK: Ensure country field is never empty ---
+        // Field ID "76" appears to be the country/region field
+        if (!additionalFields["76"] || additionalFields["76"] === "") {
+            console.log(" Country field (76) is empty. Setting to 'Others' as safety lock...");
+            additionalFields["76"] = "Others";
+        }
+        // ---------------------------------------------------------
+
         // 2. Call SimplyBook
         const bookingResult = await callSimplyBook('book', [
             eventId,
