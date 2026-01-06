@@ -55,6 +55,8 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
+        console.log("--- VERSION 2.0 LIVE --- Processing Request");
+        
         // 1. Extract data
         let { eventId, unitId, date, time, clientData, additionalFields } = req.body;
 
