@@ -208,9 +208,8 @@ router.get('/slots', async (req, res) => {
 });
 
 // ==================================================================
-// 6. GET INTAKE FORMS (NEW!)
+// 6. GET INTAKE FORMS (Fixed for Data Structure)
 // ==================================================================
-// Usage: /api/intake-forms?serviceId=1
 router.get('/intake-forms', async (req, res) => {
     try {
         const { serviceId } = req.query;
@@ -218,11 +217,20 @@ router.get('/intake-forms', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Missing serviceId' });
         }
 
-        // Retrieves the list of custom fields (questions) for this service
-        // Returns: Array of objects { id, name, type, values, mandatory, ... }
-        const fields = await callSimplyBook('getAdditionalFields', [serviceId]);
+        const fieldsRaw = await callSimplyBook('getAdditionalFields', [serviceId]);
         
-        res.json({ success: true, data: fields });
+        // FIX: Convert Object/Map to Array so frontend can loop through it
+        // and ensure we grab the data values, not just the keys.
+        let fieldsArray = [];
+        if (fieldsRaw) {
+             if (Array.isArray(fieldsRaw)) {
+                 fieldsArray = fieldsRaw;
+             } else {
+                 fieldsArray = Object.values(fieldsRaw);
+             }
+        }
+        
+        res.json({ success: true, data: fieldsArray });
 
     } catch (error) {
         console.error('Error fetching intake forms:', error.message);
