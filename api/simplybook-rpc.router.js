@@ -2,258 +2,208 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
-require('dotenv').config();
+const { createMollieClient } = require('@mollie/api-client');
 
 const router = express.Router();
 
-const API_URL = 'https://user-api.simplybook.me';
-const COMPANY = process.env.SIMPLYBOOK_COMPANY_LOGIN;
-const API_KEY = process.env.SIMPLYBOOK_API_KEY;
-const API_SECRET = process.env.SIMPLYBOOK_API_SECRET || '';
+// --- Configuration ---
+// Load these from your .env file
+const SIMPLYBOOK_URL = 'https://user-api.simplybook.me';
+const COMPANY_LOGIN = process.env.SIMPLYBOOK_COMPANY_LOGIN;
+const API_KEY = process.env.SIMPLYBOOK_API_KEY;       // Public API Key
+const SECRET_KEY = process.env.SIMPLYBOOK_SECRET_KEY; // Secret Key (for signing payment confirmations)
+const MOLLIE_API_KEY = process.env.MOLLIE_API_KEY;    // Mollie API Key
+const BASE_URL = process.env.BASE_URL || 'http://localhost:3000'; // Your public server URL (for webhooks)
 
-let tokenCache = { token: null, fetchedAt: 0, ttlMs: 1000 * 60 * 50 };
+// Initialize Mollie
+const mollieClient = createMollieClient({ apiKey: MOLLIE_API_KEY });
 
-async function getTokenCached() {
-  const now = Date.now();
-  if (tokenCache.token && now - tokenCache.fetchedAt < tokenCache.ttlMs) {
-    return tokenCache.token;
-  }
+// --- Helper: SimplyBook JSON-RPC Client ---
+async function callSimplyBook(method, params = []) {
+    try {
+        // 1. Authenticate to get a Token
+        // NOTE: In production, cache this token and reuse it until it expires to speed up requests.
+        const loginResponse = await axios.post(`${SIMPLYBOOK_URL}/login`, {
+            jsonrpc: '2.0',
+            method: 'getToken',
+            params: [COMPANY_LOGIN, API_KEY],
+            id: 1
+        });
 
-  const payload = {
-    jsonrpc: '2.0',
-    method: 'getToken',
-    params: [COMPANY, API_KEY],
-    id: 1
-  };
+        if (loginResponse.data.error) throw new Error(`Login Error: ${loginResponse.data.error.message}`);
+        const token = loginResponse.data.result;
 
-  const resp = await axios.post(`${API_URL}/login`, payload, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 15000
-  });
+        // 2. Execute the requested method
+        const response = await axios.post(SIMPLYBOOK_URL, {
+            jsonrpc: '2.0',
+            method: method,
+            params: params,
+            id: new Date().getTime()
+        }, {
+            headers: {
+                'X-Company-Login': COMPANY_LOGIN,
+                'X-Token': token
+            }
+        });
 
-  if (!resp.data || !resp.data.result) {
-    throw new Error('No token received from SimplyBook getToken');
-  }
+        if (response.data.error) throw new Error(`API Error [${method}]: ${response.data.error.message}`);
+        
+        return response.data.result;
 
-  tokenCache = {
-    token: resp.data.result,
-    fetchedAt: Date.now(),
-    ttlMs: tokenCache.ttlMs
-  };
-
-  return tokenCache.token;
+    } catch (error) {
+        console.error(`SimplyBook Call Failed: ${error.message}`);
+        throw error;
+    }
 }
 
-async function rpcCall(method, params = [], timeout = 15000) {
-  const token = await getTokenCached();
-  const payload = { jsonrpc: '2.0', method, params, id: 1 };
+// --- API Endpoints ---
 
-  const resp = await axios.post(API_URL, payload, {
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Company-Login': COMPANY,
-      'X-Token': token
-    },
-    timeout
-  });
-
-  if (resp.data && resp.data.error) {
-    const err = resp.data.error;
-    throw new Error(`${method} error ${err.code || ''}: ${err.message || JSON.stringify(err)}`);
-  }
-
-  return resp.data?.result;
-}
-
-function md5(s) {
-  return crypto.createHash('md5').update(s).digest('hex');
-}
-
-// ---- Simple raw services via getEventList (admin) ----
+/**
+ * GET /api/services
+ * Fetches the list of available services from SimplyBook.
+ */
 router.get('/services', async (req, res) => {
-  try {
-    const result = await rpcCall('getEventList', []);
-    return res.json({ ok: true, data: result || [] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- Normalized services list ----
-router.get('/services-list', async (req, res) => {
-  try {
-    const result = await rpcCall('getEventList', []);
-    const items = Array.isArray(result) ? result : Object.values(result || {});
-    let data = items.map(s => {
-      const id = s.id != null ? parseInt(s.id, 10) : null;
-      const name = s.name || '';
-      const description = s.description || s.short_description || '';
-      const duration = s.duration != null ? parseInt(s.duration, 10) : null;
-      const price = s.price_with_tax != null
-        ? Number(s.price_with_tax)
-        : (s.price != null ? Number(s.price) : null);
-      const currency = s.currency || null;
-      const rawPath = s.picture_path || null;
-      const image_url = rawPath
-        ? (rawPath.startsWith('http') ? rawPath : `${API_URL}${rawPath}`)
-        : null;
-      const is_public = s.is_public === '1' || s.is_public === 1 || s.is_public === true;
-      const is_active = s.is_active === '1' || s.is_active === 1 || s.is_active === true;
-      const categories = Array.isArray(s.categories) ? s.categories : [];
-      const providers = Array.isArray(s.providers) ? s.providers : [];
-
-      return {
-        id,
-        name,
-        description,
-        duration,
-        price,
-        currency,
-        image_url,
-        is_public,
-        is_active,
-        categories,
-        providers,
-        raw: s
-      };
-    });
-
-    const onlyActive = req.query.active === 'true';
-    const onlyPublic = req.query.public === 'true';
-    if (onlyActive || onlyPublic) {
-      data = data.filter(d =>
-        (!onlyActive || d.is_active) &&
-        (!onlyPublic || d.is_public)
-      );
+    try {
+        const services = await callSimplyBook('getEventList');
+        res.json({ success: true, data: services });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
-
-    return res.json({ ok: true, count: data.length, data });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
 });
 
-// ---- Units ----
-router.get('/units', async (req, res) => {
-  try {
-    const result = await rpcCall('getUnitList', []);
-    return res.json({ ok: true, data: result || [] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- First working day ----
-router.get('/first-working-day', async (req, res) => {
-  try {
-    const performerId = req.query.performerId ? parseInt(req.query.performerId, 10) : null;
-    const result = await rpcCall('getFirstWorkingDay', [performerId]);
-    return res.json({ ok: true, data: result });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- Work calendar ----
-router.get('/work-calendar', async (req, res) => {
-  try {
-    const year = parseInt(req.query.year, 10);
-    const month = parseInt(req.query.month, 10);
-    if (Number.isNaN(year) || Number.isNaN(month)) {
-      return res.status(400).json({ ok: false, error: 'year and month are required integers' });
+/**
+ * GET /api/performers
+ * Fetches the list of service providers (employees/units).
+ */
+router.get('/performers', async (req, res) => {
+    try {
+        const performers = await callSimplyBook('getUnitList');
+        res.json({ success: true, data: performers });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
-    const performerId = req.query.performerId ? parseInt(req.query.performerId, 10) : null;
-    const result = await rpcCall('getWorkCalendar', [year, month, performerId]);
-    return res.json({ ok: true, data: result || {} });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
 });
 
-// ---- Start time matrix ----
-router.post('/start-time-matrix', async (req, res) => {
-  try {
-    const { dateFrom, dateTo, eventId, performerId, count } = req.body || {};
-    if (!dateFrom || !dateTo || !eventId) {
-      return res.status(400).json({ ok: false, error: 'dateFrom, dateTo, and eventId are required' });
+/**
+ * GET /api/slots
+ * Fetches available time slots.
+ * Query Params: date (YYYY-MM-DD), eventId, unitId, count
+ */
+router.get('/slots', async (req, res) => {
+    try {
+        const { date, eventId, unitId, count } = req.query;
+        if (!date || !eventId || !unitId) return res.status(400).json({ error: 'Missing required params' });
+
+        // getStartTimeMatrix(dateFrom, dateTo, eventId, unitId, count)
+        const matrix = await callSimplyBook('getStartTimeMatrix', [
+            date, 
+            date, 
+            eventId, 
+            unitId, 
+            parseInt(count) || 1
+        ]);
+        
+        res.json({ success: true, data: matrix });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
-    const eventIdInt = parseInt(eventId, 10);
-    const performerIdInt = performerId != null ? parseInt(performerId, 10) : null;
-    const qty = count != null ? parseInt(count, 10) : 1;
-    const result = await rpcCall('getStartTimeMatrix', [dateFrom, dateTo, eventIdInt, performerIdInt, qty]);
-    return res.json({ ok: true, data: result || {} });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
 });
 
-// ---- Calculate end time ----
-router.post('/calculate-end-time', async (req, res) => {
-  try {
-    const { startDateTime, eventId, performerId } = req.body || {};
-    if (!startDateTime || !eventId) {
-      return res.status(400).json({ ok: false, error: 'startDateTime and eventId are required' });
-    }
-    const eventIdInt = parseInt(eventId, 10);
-    const performerIdInt = performerId != null ? parseInt(performerId, 10) : null;
-    const result = await rpcCall('calculateEndTime', [startDateTime, eventIdInt, performerIdInt]);
-    return res.json({ ok: true, data: result });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- Additional fields for an event ----
-router.get('/additional-fields', async (req, res) => {
-  try {
-    const eventId = req.query.eventId ? parseInt(req.query.eventId, 10) : null;
-    if (!eventId) {
-      return res.status(400).json({ ok: false, error: 'eventId is required' });
-    }
-    const result = await rpcCall('getAdditionalFields', [eventId]);
-    return res.json({ ok: true, data: result || [] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- Book (admin) ----
+/**
+ * POST /api/book
+ * 1. Creates a booking in SimplyBook
+ * 2. Creates a payment in Mollie
+ * 3. Returns the payment URL to the frontend
+ */
 router.post('/book', async (req, res) => {
-  try {
-    const { eventId, unitId, date, time, clientData, additional, count, batchId } = req.body || {};
-    if (!eventId || !unitId || !date || !time || !clientData) {
-      return res.status(400).json({
-        ok: false,
-        error: 'eventId, unitId, date, time, clientData are required'
-      });
+    try {
+        const { eventId, unitId, date, time, clientData } = req.body;
+        // clientData format: { name: "John", email: "john@doe.com", phone: "+123456" }
+
+        // Step 1: Create Booking in SimplyBook
+        // book(eventId, unitId, date, time, clientData, additionalFields, count)
+        const booking = await callSimplyBook('book', [
+            eventId,
+            unitId,
+            date,
+            time,
+            clientData,
+            [], // additional fields
+            1   // count
+        ]);
+
+        // SimplyBook returns: { id, code, hash, require_confirm }
+        const bookingId = booking.id;
+        const bookingHash = booking.hash; // Vital for confirming payment later
+
+        console.log(`Booking created: ID ${bookingId}, Code ${booking.code}`);
+
+        // Step 2: Create Payment in Mollie
+        // NOTE: In a real app, calculate 'value' dynamically based on the service price from getEventList
+        const payment = await mollieClient.payments.create({
+            amount: { value: '10.00', currency: 'EUR' }, 
+            description: `Booking #${booking.code}`,
+            redirectUrl: `${BASE_URL}/booking-complete?booking_id=${bookingId}`, // Frontend success page
+            webhookUrl: `${BASE_URL}/api/webhook/mollie`, // Backend webhook handler (defined below)
+            metadata: {
+                booking_id: bookingId,
+                booking_hash: bookingHash
+            }
+        });
+
+        // Step 3: Return Payment URL to frontend
+        res.json({
+            success: true,
+            bookingId: bookingId,
+            paymentUrl: payment.getCheckoutUrl()
+        });
+
+    } catch (error) {
+        console.error('Booking Flow Failed:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
+});
 
-    const params = [
-      parseInt(eventId, 10),
-      parseInt(unitId, 10),
-      date,
-      time,
-      clientData,
-      additional || {},
-      count != null ? parseInt(count, 10) : 1,
-      batchId || null
-    ];
+/**
+ * POST /api/webhook/mollie
+ * Handles payment updates from Mollie.
+ * If paid, confirms the booking in SimplyBook using the Secret Key.
+ */
+router.post('/webhook/mollie', async (req, res) => {
+    try {
+        const paymentId = req.body.id;
+        if (!paymentId) return res.status(400).send('Missing payment ID');
 
-    const bookingInfo = await rpcCall('book', params);
+        const payment = await mollieClient.payments.get(paymentId);
 
-    let confirmations = [];
-    if (bookingInfo?.require_confirm && API_SECRET) {
-      for (const b of (bookingInfo.bookings || [])) {
-        const sign = md5(`${b.id}${b.hash}${API_SECRET}`);
-        const confirmRes = await rpcCall('confirmBooking', [b.id, sign]);
-        confirmations.push({ bookingId: b.id, result: confirmRes });
-      }
+        if (payment.isPaid()) {
+            const { booking_id, booking_hash } = payment.metadata;
+
+            console.log(`Payment ${paymentId} CONFIRMED for Booking ${booking_id}`);
+
+            // Step 4: Confirm Booking in SimplyBook
+            // Calculate Signature: md5(bookingId + bookingHash + secretKey)
+            const signatureString = booking_id + booking_hash + SECRET_KEY;
+            const sign = crypto.createHash('md5').update(signatureString).digest('hex');
+
+            const confirmResult = await callSimplyBook('confirmBooking', [
+                booking_id,
+                sign
+            ]);
+
+            console.log('SimplyBook Confirmation:', confirmResult);
+        } else {
+            console.log(`Payment status: ${payment.status}`);
+            // Logic for 'failed', 'canceled', or 'expired' can go here (e.g., cancel booking)
+        }
+
+        // Always return 200 OK to Mollie to acknowledge receipt
+        res.status(200).send('OK');
+
+    } catch (error) {
+        console.error('Webhook Error:', error);
+        res.status(500).send('Server Error');
     }
-
-    return res.json({ ok: true, booking: bookingInfo, confirmations });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
 });
 
 module.exports = router;
