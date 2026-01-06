@@ -55,26 +55,26 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        // We now accept 'additionalFields' from frontend
+        // 1. Extract additionalFields from the request
         const { eventId, unitId, date, time, clientData, additionalFields } = req.body;
 
-        console.log("Booking Request Received:", { eventId, unitId, date, additionalFields });
+        console.log("Processing Booking:", { eventId, date, additionalFields });
 
-        // Step 1: Create Booking in SimplyBook
-        // Param Order: eventId, unitId, date, time, clientData, additionalFields, count, batchId
+        // 2. Pass additionalFields to SimplyBook
+        // The 6th argument MUST be the fields object, NOT []
         const bookingResult = await callSimplyBook('book', [
             eventId,
             unitId,
             date,
             time,
             clientData,
-            additionalFields || {}, // <--- IMPORTANT: Pass the fields here!
+            additionalFields || {}, // <--- THIS IS THE FIX
             1
         ]);
 
         const bookingId = bookingResult.id;
         
-        // Step 2: Create Payment in Mollie
+        // 3. Create Payment
         const payment = await mollieClient.payments.create({
             amount: { value: '35.00', currency: 'EUR' }, 
             description: `Booking #${bookingResult.code} - ${clientData.name}`,
