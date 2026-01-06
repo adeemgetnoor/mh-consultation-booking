@@ -55,7 +55,7 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        console.log("!!! VERSION 3.0 FIX IS LIVE !!! Request Received");
+        console.log("!!! VERSION 5.0 (With Intake Forms) IS LIVE !!!");
         
         // 1. Extract data
         let { eventId, unitId, date, time, clientData, additionalFields } = req.body;
@@ -64,24 +64,21 @@ router.post('/book', async (req, res) => {
 
         // --- THE FIX: Parse additionalFields if it came as a string ---
         if (typeof additionalFields === 'string') {
-            console.log(" additionalFields is a string. Parsing it to object...");
             try {
                 additionalFields = JSON.parse(additionalFields);
             } catch (e) {
                 console.error(" Failed to parse additionalFields:", e);
-                additionalFields = {}; // Fallback to empty if parsing fails
+                additionalFields = {}; 
             }
         }
-        // -------------------------------------------------------------
-
-        console.log("Sending to SimplyBook:", additionalFields);
-
+        
         // --- SAFETY LOCK: Ensure country field is never empty ---
+        // Keeps your booking working while you implement the dynamic forms
+        if (!additionalFields) additionalFields = {};
         if (!additionalFields["76"] || additionalFields["76"] === "") {
-            console.log(" Country field (76) is empty. Setting to 'Others' as safety lock...");
+            console.log("Auto-filling 'Others' to avoid haystack error.");
             additionalFields["76"] = "Others";
         }
-        // ---------------------------------------------------------
 
         // 2. Call SimplyBook
         const bookingResult = await callSimplyBook('book', [
@@ -90,7 +87,7 @@ router.post('/book', async (req, res) => {
             date,
             time,
             clientData,
-            additionalFields || {}, // Now this is guaranteed to be an Object
+            additionalFields || {}, 
             1
         ]);
 
@@ -113,7 +110,6 @@ router.post('/book', async (req, res) => {
 
     } catch (error) {
         console.error('Booking Error:', error.message);
-        // Send exact error to frontend
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -131,49 +127,33 @@ router.get('/services', async (req, res) => {
 });
 
 // ==================================================================
-// 2. GET PERFORMERS (With Filtering Logic)
+// 2. GET PERFORMERS
 // ==================================================================
-// Usage: /api/performers?serviceId=8
 router.get('/performers', async (req, res) => {
     try {
         const { serviceId } = req.query;
-
-        // Fetch all performers
         const allPerformers = await callSimplyBook('getUnitList');
         
-        // If no serviceId is provided, return everyone
-        if (!serviceId) {
-            return res.json({ success: true, data: allPerformers });
-        }
+        if (!serviceId) return res.json({ success: true, data: allPerformers });
 
-        // --- FILTERING LOGIC ---
-        // We need to fetch service list to see 'unit_map' for the selected service
         const allServices = await callSimplyBook('getEventList');
         const selectedService = allServices[serviceId];
 
-        if (!selectedService) {
-            return res.status(404).json({ success: false, error: 'Service not found' });
-        }
+        if (!selectedService) return res.status(404).json({ success: false, error: 'Service not found' });
 
-        const unitMap = selectedService.unit_map; // e.g. { "1": null, "2": null }
-        
-        // If unit_map is empty or undefined, ALL performers are allowed (usually)
-        // Otherwise, filter performers list
+        const unitMap = selectedService.unit_map;
         const filteredPerformers = {};
         
         if (unitMap && Object.keys(unitMap).length > 0) {
             Object.keys(allPerformers).forEach(unitId => {
-                // Check if this unitId exists in the service's unit_map
                 if (Object.prototype.hasOwnProperty.call(unitMap, unitId)) {
                     filteredPerformers[unitId] = allPerformers[unitId];
                 }
             });
             res.json({ success: true, data: filteredPerformers });
         } else {
-            // No specific map, return all
             res.json({ success: true, data: allPerformers });
         }
-
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -182,7 +162,6 @@ router.get('/performers', async (req, res) => {
 // ==================================================================
 // 3. GET FIRST WORKING DAY
 // ==================================================================
-// Usage: /api/first-working-day?unitId=1
 router.get('/first-working-day', async (req, res) => {
     try {
         const { unitId } = req.query;
@@ -196,9 +175,8 @@ router.get('/first-working-day', async (req, res) => {
 });
 
 // ==================================================================
-// 4. GET CALENDAR (Monthly Schedule)
+// 4. GET CALENDAR
 // ==================================================================
-// Usage: /api/calendar?year=2026&month=01&unitId=1
 router.get('/calendar', async (req, res) => {
     try {
         const { year, month, unitId } = req.query;
@@ -212,20 +190,15 @@ router.get('/calendar', async (req, res) => {
 });
 
 // ==================================================================
-// 5. GET AVAILABLE SLOTS (Time Matrix)
+// 5. GET AVAILABLE SLOTS
 // ==================================================================
-// Usage: /api/slots?date=2026-01-06&eventId=1&unitId=1&count=1
 router.get('/slots', async (req, res) => {
     try {
         const { date, eventId, unitId, count } = req.query;
         if (!date || !eventId || !unitId) return res.status(400).json({ error: 'Missing params' });
 
         const matrix = await callSimplyBook('getStartTimeMatrix', [
-            date, // from
-            date, // to (same day for single day view)
-            eventId,
-            unitId,
-            parseInt(count) || 1
+            date, date, eventId, unitId, parseInt(count) || 1
         ]);
         
         res.json({ success: true, data: matrix });
@@ -234,6 +207,32 @@ router.get('/slots', async (req, res) => {
     }
 });
 
+// ==================================================================
+// 6. GET INTAKE FORMS (NEW!)
+// ==================================================================
+// Usage: /api/intake-forms?serviceId=1
+router.get('/intake-forms', async (req, res) => {
+    try {
+        const { serviceId } = req.query;
+        if (!serviceId) {
+            return res.status(400).json({ success: false, error: 'Missing serviceId' });
+        }
+
+        // Retrieves the list of custom fields (questions) for this service
+        // Returns: Array of objects { id, name, type, values, mandatory, ... }
+        const fields = await callSimplyBook('getAdditionalFields', [serviceId]);
+        
+        res.json({ success: true, data: fields });
+
+    } catch (error) {
+        console.error('Error fetching intake forms:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==================================================================
+// WEBHOOK
+// ==================================================================
 router.post('/webhook/mollie', async (req, res) => {
     try {
         const paymentId = req.body.id;
