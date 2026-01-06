@@ -8,14 +8,17 @@ const simplyBookRouter = require('./simplybook-rpc.router');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-// --- FIX CORS HERE ---
-// Allow all origins (*) for testing, or specify your Shopify domain
+// --- CRITICAL CORS FIX ---
 app.use(cors({
-    origin: '*', // Allow all domains (easiest for development)
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+    origin: '*', // Allow all origins (Shopify, Localhost, etc.)
+    methods: ['GET', 'POST', 'OPTIONS'], // Explicitly allow OPTIONS for preflight
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+    credentials: true
 }));
+
+// Handle preflight requests specifically
+app.options('*', cors());
+
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -25,10 +28,10 @@ app.use('/api', simplyBookRouter);
 
 // Health Check
 app.get('/', (req, res) => {
-    res.send('SimplyBook.me + Mollie Integration API is running');
+    res.send('SimplyBook API Service Running');
 });
 
 // Start Server
 app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
