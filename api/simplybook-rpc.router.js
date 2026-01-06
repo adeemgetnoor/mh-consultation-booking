@@ -57,12 +57,12 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        console.log("!!! VERSION 6.0 (Webhook Fix) IS LIVE !!!");
+        console.log("!!! VERSION 7.0 (Title Fix) IS LIVE !!!");
         
-        // 1. Extract data
-        let { eventId, unitId, date, time, clientData, additionalFields } = req.body;
+        // 1. Extract data (Added serviceTitle)
+        let { eventId, serviceTitle, unitId, date, time, clientData, additionalFields } = req.body;
 
-        console.log("Raw Payload Received:", { eventId, additionalFields });
+        console.log("Raw Payload Received:", { eventId, serviceTitle, additionalFields });
 
         // --- PARSE STRINGIFIED FIELDS ---
         if (typeof additionalFields === 'string') {
@@ -77,6 +77,7 @@ router.post('/book', async (req, res) => {
         // --- SAFETY LOCK ---
         if (!additionalFields) additionalFields = {};
         if (!additionalFields["76"] || additionalFields["76"] === "") {
+            console.log("Auto-filling 'Others' to avoid haystack error.");
             additionalFields["76"] = "Others";
         }
 
@@ -90,14 +91,25 @@ router.post('/book', async (req, res) => {
             additionalFields || {}, 
             1
         ]);
+        
+        // Log the result to see why code was undefined (for debugging)
+        console.log("SimplyBook Booking Result:", JSON.stringify(bookingResult));
 
-        // 3. Create Payment with Valid Webhook URL
+        // 3. Create Payment with BETTER DESCRIPTION
         const webhookUrl = `${BASE_URL}/api/webhook/mollie`;
-        console.log("Creating Mollie Payment with Webhook:", webhookUrl);
+        
+        // Fallback title if frontend didn't send it
+        const displayTitle = serviceTitle || "Consultation";
+        
+        // Use Booking ID if Code is missing
+        const bookingRef = bookingResult.code || bookingResult.id || "Ref";
 
         const payment = await mollieClient.payments.create({
             amount: { value: '49.00', currency: 'EUR' }, 
-            description: `Booking #${bookingResult.code} - ${clientData.name}`,
+            
+            // FIX: Show Service Name + Client Name
+            description: `${displayTitle} - ${clientData.name} (#${bookingRef})`,
+            
             redirectUrl: `https://maharishi-ayurveda-de.myshopify.com/pages/booking-success`,
             webhookUrl: webhookUrl, // Must be HTTPS and Public
             metadata: {
