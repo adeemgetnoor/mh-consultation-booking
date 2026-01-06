@@ -880,11 +880,18 @@ app.get('/api/services/:serviceId', async (req, res) => {
 
 // Get available dates for a specific service (checks which dates have available time slots)
 
-// Get performers/units list (using official getUnitList method)
+// Get performers/units list - UPDATED TO USE PUBLIC API FIRST
 app.get('/api/performers', async (req, res) => {
   try {
-    const token = await getSimplyBookTokenCached();
-    const response = await callAdminRpc(token, 'getUnitList', []);
+    // Attempt 1: Try Public API (Matches Widget Behavior)
+    let response = await callPublicRpc('getUnitList', []);
+    
+    // Attempt 2: Fallback to Admin API if Public fails or returns error
+    if (!response || response.error || !response.result) {
+        console.log('Public getUnitList failed, trying Admin...');
+        const token = await getSimplyBookTokenCached();
+        response = await callAdminRpc(token, 'getUnitList', []);
+    }
 
     const performers = Array.isArray(response.result) ? response.result : Object.values(response.result || {});
     const normalizedPerformers = performers.map(p => ({
@@ -913,14 +920,21 @@ app.get('/api/performers', async (req, res) => {
   }
 });
 
-// Get work calendar for availability checking (using official getWorkCalendar method)
+// Get work calendar - UPDATED TO USE PUBLIC API FIRST
 app.post('/api/work-calendar', async (req, res) => {
   try {
     const { year, month, performerId } = req.body;
     if (!year || !month) return res.status(400).json({ success: false, error: 'Year and month are required' });
 
-    const token = await getSimplyBookTokenCached();
-    const response = await callAdminRpc(token, 'getWorkCalendar', [year, month, performerId || null]);
+    // Attempt 1: Try Public API
+    let response = await callPublicRpc('getWorkCalendar', [year, month, performerId || null]);
+
+    // Attempt 2: Fallback to Admin API
+    if (!response || response.error || !response.result) {
+       console.log('Public getWorkCalendar failed, trying Admin...');
+       const token = await getSimplyBookTokenCached();
+       response = await callAdminRpc(token, 'getWorkCalendar', [year, month, performerId || null]);
+    }
 
     const calendar = response.result || {};
 
@@ -1013,15 +1027,13 @@ app.get('/api/additional-fields/:serviceId', async (req, res) => {
 
 
 
-// Get available dates with time slots for a service (combined endpoint for convenience)
+// Get available dates - UPDATED TO USE PUBLIC API FIRST
 app.post('/api/service-availability', async (req, res) => {
   try {
     const { serviceId, startDate, endDate, performerId, count } = req.body || {};
     if (!serviceId) {
       return res.status(400).json({ success: false, error: 'Service ID is required' });
     }
-
-    const token = await getSimplyBookTokenCached();
 
     let dateFrom = startDate || new Date().toISOString().split('T')[0];
     let dateTo = endDate || (() => {
@@ -1032,23 +1044,46 @@ app.post('/api/service-availability', async (req, res) => {
 
     const availability = [];
 
-    // Try regular availability
+    // Attempt 1: Try Public API getStartTimeMatrix (Primary Method)
     try {
-      const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
+      // Note: Passing 'null' for performerId in Public API usually auto-selects available units
+      const publicResp = await callPublicRpc('getStartTimeMatrix', [
         dateFrom,
         dateTo,
         parseInt(serviceId, 10),
         performerId ? parseInt(performerId, 10) : null,
         count ? parseInt(count, 10) : 1
       ]);
+      
+      if (publicResp.result) {
+         availability.push(...normalizeTimeMatrix(publicResp.result));
+      }
+    } catch (e) {
+      console.warn("Public getStartTimeMatrix failed:", e.message);
+    }
 
-      availability.push(...normalizeTimeMatrix(matrixResp.result));
-    } catch (_) {}
+    // Attempt 2: If Public failed to return slots, Try Admin API
+    if (availability.length === 0) {
+        try {
+          const token = await getSimplyBookTokenCached();
+          const matrixResp = await callAdminRpc(token, 'getStartTimeMatrix', [
+            dateFrom,
+            dateTo,
+            parseInt(serviceId, 10),
+            performerId ? parseInt(performerId, 10) : null,
+            count ? parseInt(count, 10) : 1
+          ]);
+          if(matrixResp.result) {
+             availability.push(...normalizeTimeMatrix(matrixResp.result));
+          }
+        } catch (_) {}
+    }
 
     // Fallback to events (special days / courses)
     if (availability.length === 0) {
+      // getSlotsFromEvents uses callPublicRpc internally, so this is safe
       const timesMap = await getSlotsFromEvents(
-        token,
+        null, // Token not needed for this internal helper modification if we assume it uses Public
         serviceId,
         dateFrom,
         dateTo
