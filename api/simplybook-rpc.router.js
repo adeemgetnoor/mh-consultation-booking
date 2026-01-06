@@ -173,12 +173,26 @@ router.get('/slots', async (req, res) => {
 // ==================================================================
 router.post('/book', async (req, res) => {
     try {
-        const { eventId, unitId, date, time, clientData } = req.body;
+        const { serviceId, performerId, datetime, clientData, additionalFields } = req.body.bookingRequest;
+
+        // Extract date and time from datetime
+        const dateOnly = datetime ? datetime.split('T')[0] : null;
+        const timeOnly = datetime ? datetime.split('T')[1] : null;
+
+        // The SimplyBook 'book' method requires arguments in this EXACT order:
+        // book(eventId, unitId, date, time, clientData, additionalFields, count, batchId)
+        const simplyBookParams = [
+            serviceId,
+            performerId,
+            dateOnly, // extracted from datetime
+            timeOnly, // extracted from datetime
+            clientData,
+            additionalFields || {}, // <--- THIS MUST BE PASSED, NOT []
+            1
+        ];
 
         // Create Booking
-        const booking = await callSimplyBook('book', [
-            eventId, unitId, date, time, clientData, [], 1
-        ]);
+        const booking = await callSimplyBook('book', simplyBookParams);
 
         // Create Mollie Payment
         const payment = await mollieClient.payments.create({
