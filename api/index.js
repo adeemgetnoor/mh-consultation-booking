@@ -2,16 +2,18 @@
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
-const cors = require('cors');
+const cors = require('cors'); // Make sure to install: npm install cors
 const simplyBookRouter = require('./simplybook-rpc.router');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
+// --- FIX CORS HERE ---
+// Allow all origins (*) for testing, or specify your Shopify domain
 app.use(cors({
     origin: '*', // Allow all domains (easiest for development)
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 app.use(bodyParser.json());
@@ -23,10 +25,10 @@ app.use('/api', simplyBookRouter);
 
 // Health Check
 app.get('/', (req, res) => {
-    res.send('SimplyBook.me + Mollie API Service is Running');
+    res.send('SimplyBook.me + Mollie Integration API is running');
 });
 
 // Start Server
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server is running on http://localhost:${PORT}`);
 });
