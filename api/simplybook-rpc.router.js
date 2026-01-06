@@ -55,45 +55,43 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        // 1. Extract additionalFields from the request
+        // 1. Extract data from request body
+        // Ensure your frontend sends 'additionalFields'
         const { eventId, unitId, date, time, clientData, additionalFields } = req.body;
 
-        console.log("Processing Booking:", { eventId, date, additionalFields });
+        console.log("Processing Booking for:", clientData.name);
 
-        // 2. Pass additionalFields to SimplyBook
-        // The 6th argument MUST be the fields object, NOT []
+        // 2. Call SimplyBook 'book' method
+        // Method signature: book(eventId, unitId, date, time, clientData, additionalFields, count)
         const bookingResult = await callSimplyBook('book', [
             eventId,
             unitId,
             date,
             time,
             clientData,
-            additionalFields || {}, // <--- THIS IS THE FIX
-            1
+            additionalFields || {}, // <--- CRITICAL: Pass the fields, or an empty object
+            1 // count
         ]);
 
-        const bookingId = bookingResult.id;
-        
-        // 3. Create Payment
+        // 3. Create Mollie Payment
         const payment = await mollieClient.payments.create({
-            amount: { value: '35.00', currency: 'EUR' }, 
-            description: `Booking #${bookingResult.code} - ${clientData.name}`,
-            redirectUrl: `${BASE_URL}/booking-success?booking_id=${bookingId}`,
-            webhookUrl: `${BASE_URL}/api/webhook/mollie`,
+            amount: { value: '49.00', currency: 'EUR' }, // Match your service price
+            description: `Consultation Booking: ${clientData.name}`,
+            redirectUrl: `https://maharishi-ayurveda-de.myshopify.com/pages/booking-success`,
+            webhookUrl: `${process.env.BASE_URL}/api/webhook/mollie`,
             metadata: {
-                booking_id: bookingId,
+                booking_id: bookingResult.id,
                 booking_hash: bookingResult.hash
             }
         });
 
         res.json({ 
             success: true, 
-            bookingId: bookingId,
             paymentUrl: payment.getCheckoutUrl() 
         });
 
     } catch (error) {
-        console.error('Booking Error:', error);
+        console.error('Booking Error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
