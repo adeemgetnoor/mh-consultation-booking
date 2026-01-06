@@ -55,28 +55,40 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        // 1. Extract data from request body
-        // Ensure your frontend sends 'additionalFields'
-        const { eventId, unitId, date, time, clientData, additionalFields } = req.body;
+        // 1. Extract data
+        let { eventId, unitId, date, time, clientData, additionalFields } = req.body;
 
-        console.log("Processing Booking for:", clientData.name);
+        console.log("Raw Payload Received:", { eventId, additionalFields });
 
-        // 2. Call SimplyBook 'book' method
-        // Method signature: book(eventId, unitId, date, time, clientData, additionalFields, count)
+        // --- THE FIX: Parse additionalFields if it came as a string ---
+        if (typeof additionalFields === 'string') {
+            console.log(" additionalFields is a string. Parsing it to object...");
+            try {
+                additionalFields = JSON.parse(additionalFields);
+            } catch (e) {
+                console.error(" Failed to parse additionalFields:", e);
+                additionalFields = {}; // Fallback to empty if parsing fails
+            }
+        }
+        // -------------------------------------------------------------
+
+        console.log("Sending to SimplyBook:", additionalFields);
+
+        // 2. Call SimplyBook
         const bookingResult = await callSimplyBook('book', [
             eventId,
             unitId,
             date,
             time,
             clientData,
-            additionalFields || {}, // <--- CRITICAL: Pass the fields, or an empty object
-            1 // count
+            additionalFields || {}, // Now this is guaranteed to be an Object
+            1
         ]);
 
-        // 3. Create Mollie Payment
+        // 3. Create Payment
         const payment = await mollieClient.payments.create({
-            amount: { value: '49.00', currency: 'EUR' }, // Match your service price
-            description: `Consultation Booking: ${clientData.name}`,
+            amount: { value: '49.00', currency: 'EUR' }, 
+            description: `Booking #${bookingResult.code} - ${clientData.name}`,
             redirectUrl: `https://maharishi-ayurveda-de.myshopify.com/pages/booking-success`,
             webhookUrl: `${process.env.BASE_URL}/api/webhook/mollie`,
             metadata: {
@@ -92,6 +104,7 @@ router.post('/book', async (req, res) => {
 
     } catch (error) {
         console.error('Booking Error:', error.message);
+        // Send exact error to frontend
         res.status(500).json({ success: false, error: error.message });
     }
 });
