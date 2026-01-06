@@ -206,4 +206,23 @@ router.post('/webhook/mollie', async (req, res) => {
     }
 });
 
+/**
+ * GET /api/first-working-day
+ * Finds the first available date for a specific performer.
+ * Query Param: unitId
+ */
+router.get('/first-working-day', async (req, res) => {
+    try {
+        const { unitId } = req.query;
+        if (!unitId) return res.status(400).json({ error: 'Missing unitId' });
+
+        // SimplyBook API: getFirstWorkingDay(unitId)
+        const date = await callSimplyBook('getFirstWorkingDay', [unitId]);
+        
+        res.json({ success: true, date: date });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 module.exports = router;
