@@ -12,7 +12,9 @@ const COMPANY_LOGIN = process.env.SIMPLYBOOK_COMPANY_LOGIN;
 const API_KEY = process.env.SIMPLYBOOK_API_KEY;
 const SECRET_KEY = process.env.SIMPLYBOOK_SECRET_KEY;
 const MOLLIE_API_KEY = process.env.MOLLIE_API_KEY;
-const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+
+// --- FIX: FORCE LIVE URL (Mollie rejects localhost) ---
+const BASE_URL = 'https://mh-consultation-booking.vercel.app'; 
 
 const mollieClient = createMollieClient({ apiKey: MOLLIE_API_KEY });
 
@@ -55,28 +57,26 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        console.log("!!! VERSION 5.0 (With Intake Forms) IS LIVE !!!");
+        console.log("!!! VERSION 6.0 (Webhook Fix) IS LIVE !!!");
         
         // 1. Extract data
         let { eventId, unitId, date, time, clientData, additionalFields } = req.body;
 
         console.log("Raw Payload Received:", { eventId, additionalFields });
 
-        // --- THE FIX: Parse additionalFields if it came as a string ---
+        // --- PARSE STRINGIFIED FIELDS ---
         if (typeof additionalFields === 'string') {
             try {
                 additionalFields = JSON.parse(additionalFields);
             } catch (e) {
-                console.error(" Failed to parse additionalFields:", e);
+                console.error("Failed to parse additionalFields:", e);
                 additionalFields = {}; 
             }
         }
         
-        // --- SAFETY LOCK: Ensure country field is never empty ---
-        // Keeps your booking working while you implement the dynamic forms
+        // --- SAFETY LOCK ---
         if (!additionalFields) additionalFields = {};
         if (!additionalFields["76"] || additionalFields["76"] === "") {
-            console.log("Auto-filling 'Others' to avoid haystack error.");
             additionalFields["76"] = "Others";
         }
 
@@ -91,12 +91,15 @@ router.post('/book', async (req, res) => {
             1
         ]);
 
-        // 3. Create Payment
+        // 3. Create Payment with Valid Webhook URL
+        const webhookUrl = `${BASE_URL}/api/webhook/mollie`;
+        console.log("Creating Mollie Payment with Webhook:", webhookUrl);
+
         const payment = await mollieClient.payments.create({
             amount: { value: '49.00', currency: 'EUR' }, 
             description: `Booking #${bookingResult.code} - ${clientData.name}`,
             redirectUrl: `https://maharishi-ayurveda-de.myshopify.com/pages/booking-success`,
-            webhookUrl: `${process.env.BASE_URL}/api/webhook/mollie`,
+            webhookUrl: webhookUrl, // Must be HTTPS and Public
             metadata: {
                 booking_id: bookingResult.id,
                 booking_hash: bookingResult.hash
@@ -208,7 +211,7 @@ router.get('/slots', async (req, res) => {
 });
 
 // ==================================================================
-// 6. GET INTAKE FORMS (Fixed for Data Structure)
+// 6. GET INTAKE FORMS
 // ==================================================================
 router.get('/intake-forms', async (req, res) => {
     try {
@@ -218,9 +221,6 @@ router.get('/intake-forms', async (req, res) => {
         }
 
         const fieldsRaw = await callSimplyBook('getAdditionalFields', [serviceId]);
-        
-        // FIX: Convert Object/Map to Array so frontend can loop through it
-        // and ensure we grab the data values, not just the keys.
         let fieldsArray = [];
         if (fieldsRaw) {
              if (Array.isArray(fieldsRaw)) {
