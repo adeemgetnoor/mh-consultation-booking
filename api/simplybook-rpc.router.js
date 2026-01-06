@@ -19,7 +19,7 @@ const mollieClient = createMollieClient({ apiKey: MOLLIE_API_KEY });
 // --- Helper: SimplyBook JSON-RPC Client ---
 async function callSimplyBook(method, params = []) {
     try {
-        // 1. Authenticate (Login)
+        // 1. Get Token
         const loginResponse = await axios.post(`${SIMPLYBOOK_URL}/login`, {
             jsonrpc: '2.0',
             method: 'getToken',
@@ -30,7 +30,7 @@ async function callSimplyBook(method, params = []) {
         if (loginResponse.data.error) throw new Error(`Login Error: ${loginResponse.data.error.message}`);
         const token = loginResponse.data.result;
 
-        // 2. Execute Method
+        // 2. Call API
         const response = await axios.post(SIMPLYBOOK_URL, {
             jsonrpc: '2.0',
             method: method,
@@ -51,6 +51,52 @@ async function callSimplyBook(method, params = []) {
         throw error;
     }
 }
+
+// --- Route: Initiate Booking & Payment ---
+router.post('/book', async (req, res) => {
+    try {
+        // We now accept 'additionalFields' from frontend
+        const { eventId, unitId, date, time, clientData, additionalFields } = req.body;
+
+        console.log("Booking Request Received:", { eventId, unitId, date, additionalFields });
+
+        // Step 1: Create Booking in SimplyBook
+        // Param Order: eventId, unitId, date, time, clientData, additionalFields, count, batchId
+        const bookingResult = await callSimplyBook('book', [
+            eventId,
+            unitId,
+            date,
+            time,
+            clientData,
+            additionalFields || {}, // <--- IMPORTANT: Pass the fields here!
+            1
+        ]);
+
+        const bookingId = bookingResult.id;
+        
+        // Step 2: Create Payment in Mollie
+        const payment = await mollieClient.payments.create({
+            amount: { value: '35.00', currency: 'EUR' }, 
+            description: `Booking #${bookingResult.code} - ${clientData.name}`,
+            redirectUrl: `${BASE_URL}/booking-success?booking_id=${bookingId}`,
+            webhookUrl: `${BASE_URL}/api/webhook/mollie`,
+            metadata: {
+                booking_id: bookingId,
+                booking_hash: bookingResult.hash
+            }
+        });
+
+        res.json({ 
+            success: true, 
+            bookingId: bookingId,
+            paymentUrl: payment.getCheckoutUrl() 
+        });
+
+    } catch (error) {
+        console.error('Booking Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 
 // ==================================================================
 // 1. GET SERVICES
@@ -164,54 +210,6 @@ router.get('/slots', async (req, res) => {
         
         res.json({ success: true, data: matrix });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==================================================================
-// 6. BOOKING & PAYMENT FLOW
-// ==================================================================
-router.post('/book', async (req, res) => {
-    try {
-        const { eventId, unitId, date, time, clientData, additionalFields } = req.body;
-
-        console.log("Booking Request:", { eventId, unitId, date, time, clientData, additionalFields });
-
-        // Step 1: Create Booking in SimplyBook
-        // IMPORTANT: We pass 'additionalFields' (which contains Country) to SimplyBook
-        const bookingResult = await callSimplyBook('book', [
-            eventId,
-            unitId,
-            date,
-            time,
-            clientData,
-            additionalFields || {}, // <--- THIS WAS THE FIX. It must not be empty []
-            1
-        ]);
-
-        const bookingId = bookingResult.id;
-        
-        // Step 2: Create Payment in Mollie
-        const payment = await mollieClient.payments.create({
-            amount: { value: '35.00', currency: 'EUR' }, // Ensure price matches your service
-            description: `Booking #${bookingResult.code} - ${clientData.name}`,
-            redirectUrl: `${BASE_URL}/booking-success?booking_id=${bookingId}`, // Update your return URL
-            webhookUrl: `${BASE_URL}/api/webhook/mollie`,
-            metadata: {
-                booking_id: bookingId,
-                booking_hash: bookingResult.hash
-            }
-        });
-
-        res.json({ 
-            success: true, 
-            bookingId: bookingId,
-            paymentUrl: payment.getCheckoutUrl() 
-        });
-
-    } catch (error) {
-        console.error('Booking Error:', error);
-        // Send exact error message back to frontend so we can see "haystack" errors
         res.status(500).json({ success: false, error: error.message });
     }
 });
