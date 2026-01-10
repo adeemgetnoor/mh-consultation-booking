@@ -114,7 +114,8 @@ router.post('/book', async (req, res) => {
             webhookUrl: webhookUrl, // Must be HTTPS and Public
             metadata: {
                 booking_id: bookingResult.id,
-                booking_hash: bookingResult.hash
+                booking_hash: bookingResult.hash,
+                client_email: clientData.email
             }
         });
 
@@ -259,13 +260,21 @@ router.post('/webhook/mollie', async (req, res) => {
         const payment = await mollieClient.payments.get(paymentId);
 
         if (payment.isPaid()) {
-            const { booking_id, booking_hash } = payment.metadata;
+            const { booking_id, booking_hash, client_email } = payment.metadata;
+            
+            // This line ensures the booking is confirmed in SimplyBook.me
+            // The SimplyBook.me confirmation email is triggered by this successful call.
             const sign = crypto.createHash('md5').update(booking_id + booking_hash + SECRET_KEY).digest('hex');
             await callSimplyBook('confirmBooking', [booking_id, sign]);
+            
+            // --- OPTIONAL: Add Logging ---
+            console.log(`Booking ${booking_id} successfully confirmed via Mollie webhook.`);
         }
         res.send('OK');
     } catch (error) {
-        console.error(error);
+        console.error('Mollie Webhook Error:', error);
+        // It's good practice to send a 500 error back if processing fails, but
+        // simply sending 'OK' is sometimes required by webhooks to prevent retries.
         res.status(500).send('Error');
     }
 });
