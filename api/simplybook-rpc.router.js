@@ -10,7 +10,7 @@ const router = express.Router();
 const SIMPLYBOOK_URL = 'https://user-api.simplybook.me';
 const COMPANY_LOGIN = process.env.SIMPLYBOOK_COMPANY_LOGIN;
 const API_KEY = process.env.SIMPLYBOOK_API_KEY;
-const SECRET_KEY = process.env.SIMPLYBOOK_SECRET_KEY;
+const SECRET_KEY = process.env.SIMPLYBOOK_API_SECRET; // Matches .env key name
 const MOLLIE_API_KEY = process.env.MOLLIE_API_KEY;
 
 // --- FIX: FORCE LIVE URL (Mollie rejects localhost) ---
@@ -254,28 +254,55 @@ router.get('/intake-forms', async (req, res) => {
 // ==================================================================
 // WEBHOOK
 // ==================================================================
+
+// Idempotency guard — track already-processed payment IDs in memory.
+// (For multi-instance deployments, replace with a DB/Redis flag.)
+const processedPayments = new Set();
+
 router.post('/webhook/mollie', async (req, res) => {
+    // Always respond 200 immediately so Mollie stops retrying on transient errors.
+    // All logic runs after the response is acknowledged.
+    res.send('OK');
+
     try {
         const paymentId = req.body.id;
+        if (!paymentId) {
+            console.warn('[Webhook] Received request with no paymentId — ignoring.');
+            return;
+        }
+
+        // --- Idempotency check ---
+        if (processedPayments.has(paymentId)) {
+            console.log(`[Webhook] Payment ${paymentId} already processed — skipping duplicate.`);
+            return;
+        }
+
+        console.log(`[Webhook] Processing payment: ${paymentId}`);
         const payment = await mollieClient.payments.get(paymentId);
+        console.log(`[Webhook] Payment status: ${payment.status}`);
 
         if (payment.isPaid()) {
             const { booking_id, booking_hash, client_email } = payment.metadata;
-            
-            // This line ensures the booking is confirmed in SimplyBook.me
-            // The SimplyBook.me confirmation email is triggered by this successful call.
+            console.log(`[Webhook] Payment paid. Confirming booking: ${booking_id} (client: ${client_email})`);
+
+            // Build the MD5 signature expected by SimplyBook confirmBooking.
+            // SECRET_KEY must equal process.env.SIMPLYBOOK_API_SECRET
             const sign = crypto.createHash('md5').update(booking_id + booking_hash + SECRET_KEY).digest('hex');
+            console.log(`[Webhook] Computed sign for booking ${booking_id}: ${sign}`);
+
             await callSimplyBook('confirmBooking', [booking_id, sign]);
-            
-            // --- OPTIONAL: Add Logging ---
-            console.log(`Booking ${booking_id} successfully confirmed via Mollie webhook.`);
+
+            // Mark as processed to prevent duplicate confirmations on retry
+            processedPayments.add(paymentId);
+
+            console.log(`[Webhook] ✅ Booking ${booking_id} confirmed. SimplyBook will send email to ${client_email}.`);
+        } else {
+            console.log(`[Webhook] Payment ${paymentId} is not paid (status: ${payment.status}). No action taken.`);
         }
-        res.send('OK');
     } catch (error) {
-        console.error('Mollie Webhook Error:', error);
-        // It's good practice to send a 500 error back if processing fails, but
-        // simply sending 'OK' is sometimes required by webhooks to prevent retries.
-        res.status(500).send('Error');
+        // Log the error but do NOT change the HTTP response — 200 was already sent.
+        // This prevents Mollie from retrying and causing duplicate bookings.
+        console.error('[Webhook] ❌ Error processing Mollie webhook:', error.message);
     }
 });
 
