@@ -6,7 +6,7 @@ const { createMollieClient } = require('@mollie/api-client');
 
 const router = express.Router();
 
-// --- Configuration ---
+//Configuration
 const SIMPLYBOOK_URL = 'https://user-api.simplybook.me';
 const COMPANY_LOGIN = process.env.SIMPLYBOOK_COMPANY_LOGIN;
 const API_KEY = process.env.SIMPLYBOOK_API_KEY;
@@ -57,7 +57,7 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        console.log("!!! VERSION 8.0 (Dynamic Pricing) IS LIVE !!!");
+        console.log("VERSION 8.0 (Dynamic Pricing) IS LIVE");
         
         // 1. Extract data (Added serviceTitle + servicePrice)
         let { eventId, serviceTitle, servicePrice, unitId, date, time, clientData, additionalFields } = req.body;
