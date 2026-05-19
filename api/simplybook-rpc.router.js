@@ -57,10 +57,10 @@ async function callSimplyBook(method, params = []) {
 // --- Route: Initiate Booking & Payment ---
 router.post('/book', async (req, res) => {
     try {
-        console.log("!!! VERSION 7.0 (Title Fix) IS LIVE !!!");
+        console.log("!!! VERSION 8.0 (Dynamic Pricing) IS LIVE !!!");
         
-        // 1. Extract data (Added serviceTitle)
-        let { eventId, serviceTitle, unitId, date, time, clientData, additionalFields } = req.body;
+        // 1. Extract data (Added serviceTitle + servicePrice)
+        let { eventId, serviceTitle, servicePrice, unitId, date, time, clientData, additionalFields } = req.body;
 
         console.log("Raw Payload Received:", { eventId, serviceTitle, additionalFields });
 
@@ -104,10 +104,20 @@ router.post('/book', async (req, res) => {
         // Use Booking ID if Code is missing
         const bookingRef = bookingResult.code || bookingResult.id || "Ref";
 
+        // Sanitize and resolve the payment amount dynamically from the service price.
+        // Strip currency symbols/whitespace, then validate it's a positive number.
+        const rawPrice = String(servicePrice || '').replace(/[^0-9.]/g, '').trim();
+        const parsedPrice = parseFloat(rawPrice);
+        const paymentAmount = (!isNaN(parsedPrice) && parsedPrice > 0)
+            ? parsedPrice.toFixed(2)
+            : '49.00'; // Fallback if frontend didn't send a valid price
+
+        console.log(`[Pricing] Received servicePrice: "${servicePrice}" → using: ${paymentAmount}`);
+
         const payment = await mollieClient.payments.create({
-            amount: { value: '49.00', currency: 'EUR' }, 
+            amount: { value: paymentAmount, currency: 'EUR' },
             
-            // FIX: Show Service Name + Client Name
+            // Show Service Name + Client Name
             description: `${displayTitle} - ${clientData.name} (#${bookingRef})`,
             
             redirectUrl: `https://maharishi-ayurveda-de.myshopify.com/pages/booking-success`,
