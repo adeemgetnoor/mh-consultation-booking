@@ -281,7 +281,7 @@ router.post('/webhook/mollie', async (req, res) => {
         const payment = await mollieClient.payments.get(paymentId);
         console.log(`[Webhook] Payment status: ${payment.status}`);
 
-        if (payment.isPaid()) {
+        if (payment.status === 'paid') {
             const { booking_id, booking_hash, client_email } = payment.metadata;
             console.log(`[Webhook] Payment paid. Confirming booking: ${booking_id} (client: ${client_email})`);
 
