@@ -76,9 +76,16 @@ router.post('/book', async (req, res) => {
         
         // --- SAFETY LOCK ---
         if (!additionalFields) additionalFields = {};
-        if (!additionalFields["76"] || additionalFields["76"] === "") {
-            console.log("Auto-filling 'Others' to avoid haystack error.");
-            additionalFields["76"] = "Others";
+        const countryHash = "af52b1079ef44e95cda69a8e74506899";
+        if (additionalFields[countryHash]) {
+            // Correctly set using the hash
+        } else if (additionalFields["76"]) {
+            // Map numeric ID to the hash
+            additionalFields[countryHash] = additionalFields["76"];
+            delete additionalFields["76"];
+        } else {
+            console.log("Auto-filling country hash to 'Others' to avoid haystack error.");
+            additionalFields[countryHash] = "Others";
         }
 
         // 2. Call SimplyBook
@@ -141,12 +148,57 @@ router.post('/book', async (req, res) => {
 });
 
 // ==================================================================
-// 1. GET SERVICES
+// 1. GET SERVICES (with full location data merged in)
 // ==================================================================
 router.get('/services', async (req, res) => {
     try {
-        const services = await callSimplyBook('getEventList');
-        res.json({ success: true, data: services });
+        // Fetch services and locations in parallel for speed
+        const [services, locations] = await Promise.allSettled([
+            callSimplyBook('getEventList'),
+            callSimplyBook('getLocationList')
+        ]);
+
+        const servicesData = services.status === 'fulfilled' ? services.value : {};
+
+        // Build a location lookup map: { "1": { name, address, city, country, zip, ... } }
+        const locationMap = {};
+        if (locations.status === 'fulfilled' && locations.value) {
+            const locList = locations.value;
+            const locArray = Array.isArray(locList) ? locList : Object.values(locList);
+            locArray.forEach(loc => {
+                if (loc && loc.id) locationMap[String(loc.id)] = loc;
+            });
+            console.log(`[Services] Loaded ${locArray.length} location(s) from SimplyBook.`);
+        } else {
+            console.warn('[Services] getLocationList not available or failed — locations will be empty.');
+        }
+
+        // Merge location data onto each service
+        const enrichedServices = {};
+        const serviceEntries = Array.isArray(servicesData)
+            ? servicesData.map((s, i) => [String(i), s])
+            : Object.entries(servicesData);
+
+        serviceEntries.forEach(([key, svc]) => {
+            // SimplyBook may use location_id, location, or unit_group_id to link location
+            const locId = String(svc.location_id || svc.location || '');
+            const matchedLoc = locationMap[locId] || null;
+
+            enrichedServices[key] = {
+                ...svc,
+                _location: matchedLoc
+                    ? {
+                        name:    matchedLoc.name    || '',
+                        address: matchedLoc.address || '',
+                        city:    matchedLoc.city    || '',
+                        country: matchedLoc.country || '',
+                        zip:     matchedLoc.zip     || matchedLoc.postal_code || ''
+                    }
+                    : null
+            };
+        });
+
+        res.json({ success: true, data: enrichedServices });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -257,6 +309,28 @@ router.get('/intake-forms', async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching intake forms:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==================================================================
+// 7. VALIDATE PROMO CODE
+// ==================================================================
+router.get('/validate-promo', async (req, res) => {
+    try {
+        const { code } = req.query;
+        if (!code) {
+            return res.status(400).json({ success: false, error: 'Missing promo code' });
+        }
+
+        const promoInfo = await callSimplyBook('getPromocodeInfo', [code]);
+        if (!promoInfo) {
+            return res.json({ success: false, error: 'Invalid promo code' });
+        }
+
+        res.json({ success: true, data: promoInfo });
+    } catch (error) {
+        console.error('Error validating promo code:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
